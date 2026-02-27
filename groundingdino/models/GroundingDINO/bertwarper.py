@@ -24,9 +24,67 @@ class BertModelWarper(nn.Module):
         self.encoder = bert_model.encoder
         self.pooler = bert_model.pooler
 
-        self.get_extended_attention_mask = bert_model.get_extended_attention_mask
-        self.invert_attention_mask = bert_model.invert_attention_mask
-        self.get_head_mask = bert_model.get_head_mask
+        self.get_extended_attention_mask = getattr(
+            bert_model, "get_extended_attention_mask", self._get_extended_attention_mask_fallback
+        )
+        self.invert_attention_mask = getattr(
+            bert_model, "invert_attention_mask", self._invert_attention_mask_fallback
+        )
+        self.get_head_mask = getattr(bert_model, "get_head_mask", self._get_head_mask_fallback)
+
+    def _attention_mask_dtype(self):
+        return next(self.parameters()).dtype
+
+    def _get_extended_attention_mask_fallback(self, attention_mask, input_shape, device=None):
+        if device is not None:
+            attention_mask = attention_mask.to(device)
+
+        if attention_mask.dim() == 3:
+            extended_attention_mask = attention_mask[:, None, :, :]
+        elif attention_mask.dim() == 2:
+            extended_attention_mask = attention_mask[:, None, None, :]
+        else:
+            raise ValueError(
+                f"Wrong shape for attention_mask (shape {attention_mask.shape})"
+            )
+
+        dtype = self._attention_mask_dtype()
+        extended_attention_mask = extended_attention_mask.to(dtype=dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(dtype).min
+        return extended_attention_mask
+
+    def _invert_attention_mask_fallback(self, encoder_attention_mask):
+        if encoder_attention_mask.dim() == 3:
+            encoder_extended_attention_mask = encoder_attention_mask[:, None, :, :]
+        elif encoder_attention_mask.dim() == 2:
+            encoder_extended_attention_mask = encoder_attention_mask[:, None, None, :]
+        else:
+            raise ValueError(
+                f"Wrong shape for encoder_attention_mask (shape {encoder_attention_mask.shape})"
+            )
+
+        dtype = self._attention_mask_dtype()
+        encoder_extended_attention_mask = encoder_extended_attention_mask.to(dtype=dtype)
+        encoder_extended_attention_mask = (1.0 - encoder_extended_attention_mask) * torch.finfo(
+            dtype
+        ).min
+        return encoder_extended_attention_mask
+
+    def _get_head_mask_fallback(self, head_mask, num_hidden_layers, is_attention_chunked=False):
+        if head_mask is not None:
+            if head_mask.dim() == 1:
+                head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
+            elif head_mask.dim() == 2:
+                head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+
+            head_mask = head_mask.to(dtype=self._attention_mask_dtype())
+            if is_attention_chunked:
+                head_mask = head_mask.unsqueeze(-1)
+        else:
+            head_mask = [None] * num_hidden_layers
+
+        return head_mask
 
     def forward(
         self,
@@ -106,9 +164,19 @@ class BertModelWarper(nn.Module):
 
         # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
         # ourselves in which case we just need to make it broadcastable to all heads.
-        extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(
-            attention_mask, input_shape, device
-        )
+        try:
+            extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(
+                attention_mask, input_shape, device=device
+            )
+        except TypeError:
+            try:
+                extended_attention_mask = self.get_extended_attention_mask(
+                    attention_mask, input_shape, dtype=self._attention_mask_dtype()
+                )
+            except TypeError:
+                extended_attention_mask = self.get_extended_attention_mask(
+                    attention_mask, input_shape
+                )
 
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
