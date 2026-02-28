@@ -64,7 +64,6 @@ import groundingdino.datasets.transforms as T
 from huggingface_hub import hf_hub_download
 
 
-
 # Use this command for evaluate the Grounding DINO model
 config_file = "groundingdino/config/GroundingDINO_SwinT_OGC.py"
 ckpt_repo_id = "ShilongLiu/GroundingDINO"
@@ -291,7 +290,8 @@ def extract_single_frame(video_path, frame_idx, crop_params=None, output_dir=Non
         print(f"Error extracting frame {frame_idx}: {e}")
         return None
 
-def process_frame_detection(frame_info, grounding_caption, box_threshold, text_threshold):
+def process_frame_detection(frame_info, grounding_caption, box_threshold, text_threshold,
+                            max_box_area=None, min_box_area=None):
     """
     处理单个帧的检测（用于多线程）
 
@@ -300,6 +300,8 @@ def process_frame_detection(frame_info, grounding_caption, box_threshold, text_t
         grounding_caption: 检测提示词
         box_threshold: 边界框阈值
         text_threshold: 文本阈值
+        max_box_area: 最大框面积（像素），超过此面积的框将被过滤（用于过滤大物体如树木）
+        min_box_area: 最小框面积（像素），小于此面积的框将被过滤（用于过滤噪声）
 
     Returns:
         检测结果字典
@@ -323,16 +325,56 @@ def process_frame_detection(frame_info, grounding_caption, box_threshold, text_t
             device=DEVICE
         )
 
-        # 统计数量
-        count = len(boxes)
+        # 按框大小筛选
+        filtered_boxes = []
+        filtered_logits = []
+        filtered_phrases = []
+        filtered_areas = []
 
-        # 创建标注图像
+        if boxes is not None and len(boxes) > 0:
+            img_h, img_w = image_rgb.size[1], image_rgb.size[0]
+
+            for box, logit, phrase in zip(boxes, logits, phrases):
+                # box格式: [cx, cy, w, h] (归一化坐标)
+                cx, cy, bw, bh = box
+
+                # 计算实际像素面积
+                box_w = bw * img_w
+                box_h = bh * img_h
+                box_area = box_w * box_h
+
+                # 筛选条件
+                if max_box_area is not None and box_area > max_box_area:
+                    continue  # 跳过过大的框（如树木）
+                if min_box_area is not None and box_area < min_box_area:
+                    continue  # 跳过过小的框（如噪声）
+
+                filtered_boxes.append(box)
+                filtered_logits.append(logit)
+                filtered_phrases.append(phrase)
+                filtered_areas.append(box_area)
+
+            # 转换为tensor
+            if len(filtered_boxes) > 0:
+                filtered_boxes = torch.stack(filtered_boxes)
+                filtered_logits = torch.stack(filtered_logits)
+            else:
+                filtered_boxes = None
+                filtered_logits = None
+        else:
+            filtered_boxes = boxes
+            filtered_logits = logits
+
+        # 统计数量（使用筛选后的）
+        count = len(filtered_boxes) if filtered_boxes is not None else 0
+
+        # 创建标注图像（使用筛选后的框）
         image_pil = image_transform_grounding_for_vis(image_rgb)
         annotated_frame = annotate(
             image_source=np.asarray(image_pil),
-            boxes=boxes,
-            logits=logits,
-            phrases=phrases
+            boxes=filtered_boxes,
+            logits=filtered_logits,
+            phrases=filtered_phrases
         )
         image_with_box = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
 
@@ -343,9 +385,10 @@ def process_frame_detection(frame_info, grounding_caption, box_threshold, text_t
             "detected_items": [
                 {
                     "label": phrase,
-                    "confidence": float(logit)
+                    "confidence": float(logit),
+                    "area": float(area) if filtered_areas else None
                 }
-                for phrase, logit in zip(phrases, logits)
+                for phrase, logit, area in zip(filtered_phrases, filtered_logits, filtered_areas)
             ],
             "annotated_image": Image.fromarray(image_with_box)
         }
@@ -377,7 +420,7 @@ def extract_frames_stage(
     progress=gr.Progress()
 ):
     """
-    第一阶段：从视频中提取帧
+    第一阶段：从视频中提取帧（固定间隔抽帧）
 
     Returns:
         (stage_data_json, preview_images, info_text)
@@ -430,11 +473,10 @@ def extract_frames_stage(
         # 创建临时目录保存帧
         temp_dir = tempfile.mkdtemp(prefix="video_frames_")
 
-        # 计算需要提取的帧数
+        # 固定间隔抽帧
         frame_indices = list(range(start_frame, end_frame, frame_interval))
         total_to_extract = len(frame_indices)
 
-        # 提取帧
         extracted_frames = []
         preview_images = []
 
@@ -473,10 +515,9 @@ def extract_frames_stage(
         }
 
         info_text = (
-            f"✓ 抽帧完成!\n"
+            f"✓ 抽帧完成! (固定间隔: 每{frame_interval}帧)\n"
             f"视频信息: {total_frames}帧, {fps}fps, {duration:.1f}秒\n"
             f"处理范围: 帧 {start_frame} - {end_frame}\n"
-            f"抽帧间隔: 每{frame_interval}帧\n"
             f"已提取帧数: {len(extracted_frames)}\n"
             f"临时目录: {temp_dir}\n"
             f"\n请点击'开始检测'进行物品检测"
@@ -498,6 +539,8 @@ def detect_items_stage(
     box_threshold,
     text_threshold,
     num_workers,
+    max_box_area,
+    min_box_area,
     progress=gr.Progress()
 ):
     """
@@ -509,6 +552,8 @@ def detect_items_stage(
         box_threshold: 边界框阈值
         text_threshold: 文本阈值
         num_workers: 并行工作线程数
+        max_box_area: 最大框面积（像素），超过此面积的框将被过滤
+        min_box_area: 最小框面积（像素），小于此面积的框将被过滤
 
     Returns:
         (json_output, sample_images, info_text)
@@ -547,7 +592,9 @@ def detect_items_stage(
                         frame_info,
                         grounding_caption,
                         box_threshold,
-                        text_threshold
+                        text_threshold,
+                        max_box_area,
+                        min_box_area
                     )
                     future_to_frame[future] = frame_idx
 
@@ -560,16 +607,12 @@ def detect_items_stage(
             for future in as_completed(future_to_frame):
                 result = future.result()
                 if result:
-                    # 移除annotated_image字段，只保留基本信息
-                    result_copy = result.copy()
-                    if "annotated_image" in result_copy:
-                        annotated_img = result_copy.pop("annotated_image")
+                    # 保留完整的结果，包括标注图片
+                    results.append(result)
 
-                        # 保存前5帧作为样本
-                        if len(sample_images) < 5:
-                            sample_images.append(annotated_img)
-
-                    results.append(result_copy)
+                    # 保存前5帧作为样本显示
+                    if "annotated_image" in result and len(sample_images) < 5:
+                        sample_images.append(result["annotated_image"])
 
                 completed += 1
                 # 确保进度不超过100%
@@ -579,16 +622,68 @@ def detect_items_stage(
         # 按帧号排序
         results.sort(key=lambda x: x["frame"])
 
-        # 获取视频名称
+        # 获取视频名称和时间戳
         video_name = Path(video_path).stem
+        from datetime import datetime
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # 创建输出目录
         output_dir = Path(__file__).resolve().parents[1] / "output" / "detection_results"
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # 生成JSON文件名（包含视频名称和时间戳）
-        from datetime import datetime
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 创建标注图片目录（每次处理前清空）
+        annotated_images_dir = output_dir / "latest_annotated_frames"
+        # 清空目录中的旧文件
+        if annotated_images_dir.exists():
+            import shutil
+            shutil.rmtree(annotated_images_dir)
+        annotated_images_dir.mkdir(parents=True, exist_ok=True)
+
+        # 保存所有标注后的图片
+        annotated_images_paths = []
+        for result in results:
+            if "annotated_image" in result:
+                frame_idx = result["frame"]
+                # 使用固定文件名模式，方便覆盖
+                image_filename = f"frame_{frame_idx:06d}.png"
+                image_filepath = annotated_images_dir / image_filename
+
+                # 保存图片
+                try:
+                    result["annotated_image"].save(image_filepath)
+                    annotated_images_paths.append(str(image_filepath))
+                except Exception as e:
+                    print(f"保存图片 {image_filename} 失败: {e}")
+
+        # 创建ZIP文件包含所有标注图片
+        zip_filepath = None
+        if annotated_images_paths:
+            try:
+                import zipfile
+                zip_filename = f"{video_name}_annotated_frames_{timestamp_str}.zip"
+                zip_filepath = output_dir / zip_filename
+
+                with zipfile.ZipFile(zip_filepath, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for image_path in annotated_images_paths:
+                        arcname = Path(image_path).name
+                        zipf.write(image_path, arcname)
+
+                print(f"✓ ZIP文件已创建: {zip_filepath}")
+            except Exception as e:
+                print(f"创建ZIP文件失败: {e}")
+                zip_filepath = None
+
+        # 移除annotated_image字段后准备JSON数据
+        results_for_json = []
+        for result in results:
+            result_copy = result.copy()
+            if "annotated_image" in result_copy:
+                del result_copy["annotated_image"]
+            if "error" in result_copy:
+                del result_copy["error"]
+            results_for_json.append(result_copy)
+
+        # 生成JSON文件名
         json_filename = f"{video_name}_{timestamp_str}.json"
         json_filepath = output_dir / json_filename
 
@@ -597,6 +692,8 @@ def detect_items_stage(
             "video_name": video_name,
             "video_path": video_path,
             "detection_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "annotated_images_dir": str(annotated_images_dir),
+            "annotated_images_count": len(annotated_images_paths),
             "video_info": {
                 "fps": fps,
                 "total_frames": stage_data["total_frames"],
@@ -618,7 +715,7 @@ def detect_items_stage(
                 "total_items_detected": sum(r["count"] for r in results),
                 "average_items_per_frame": sum(r["count"] for r in results) / len(results) if results else 0
             },
-            "results": results
+            "results": results_for_json
         }
 
         # 转换为JSON
@@ -635,6 +732,8 @@ def detect_items_stage(
         # 统计信息
         total_detected = output_data["statistics"]["total_items_detected"]
         avg_count = output_data["statistics"]["average_items_per_frame"]
+
+        zip_info = f"\n✓ ZIP文件已保存:\n{zip_filepath}" if zip_filepath else ""
         info_text = (
             f"✓ 检测完成!\n"
             f"视频信息: {stage_data['total_frames']}帧, {fps}fps, {stage_data['duration']:.1f}秒\n"
@@ -644,10 +743,13 @@ def detect_items_stage(
             f"并行线程: {num_workers}\n"
             f"总检测数量: {total_detected}\n"
             f"平均每帧: {avg_count:.1f}个\n"
-            f"\n✓ JSON已保存:\n{json_filepath}"
+            f"\n✓ JSON已保存:\n{json_filepath}\n"
+            f"✓ 标注图片已保存:\n{annotated_images_dir}\n"
+            f"共 {len(annotated_images_paths)} 张图片"
+            f"{zip_info}"
         )
 
-        return json_output, sample_images, info_text, str(json_filepath)
+        return json_output, sample_images, info_text, str(json_filepath), str(zip_filepath) if zip_filepath else None
 
     except Exception as e:
         import traceback
@@ -767,6 +869,7 @@ if __name__ == "__main__":
 
                         # 阶段1：抽帧参数
                         gr.Markdown("### 第一阶段：抽帧参数")
+
                         with gr.Accordion("视频处理参数", open=True):
                             start_time = gr.Textbox(
                                 label="起始时间",
@@ -792,28 +895,28 @@ if __name__ == "__main__":
                                 label="裁剪宽度",
                                 minimum=100,
                                 maximum=1920,
-                                value=350,
+                                value=300,
                                 step=10
                             )
                             crop_height = gr.Slider(
                                 label="裁剪高度",
                                 minimum=100,
                                 maximum=1920,
-                                value=350,
+                                value=300,
                                 step=10
                             )
                             crop_x = gr.Slider(
                                 label="裁剪起始X",
                                 minimum=0,
                                 maximum=1920,
-                                value=1050,
+                                value=1080,
                                 step=10
                             )
                             crop_y = gr.Slider(
                                 label="裁剪起始Y",
                                 minimum=0,
                                 maximum=1920,
-                                value=1280,
+                                value=1320,
                                 step=10
                             )
 
@@ -826,7 +929,7 @@ if __name__ == "__main__":
                         gr.Markdown("### 第二阶段：检测参数")
                         grounding_caption_video = gr.Textbox(
                             label="Detection Prompt",
-                            value="object",
+                            value="bike",
                             placeholder="例如: person, car, bottle"
                         )
 
@@ -835,25 +938,50 @@ if __name__ == "__main__":
                                 label="Box Threshold",
                                 minimum=0.0,
                                 maximum=1.0,
-                                value=0.25,
-                                step=0.001
+                                value=0.12,
+                                step=0.01
                             )
                             text_threshold_video = gr.Slider(
                                 label="Text Threshold",
                                 minimum=0.0,
                                 maximum=1.0,
-                                value=0.25,
-                                step=0.001
+                                value=1,
+                                step=0.01
                             )
 
                         num_workers = gr.Slider(
                             label="并行线程数",
                             minimum=1,
                             maximum=8,
-                            value=2,
+                            value=8,
                             step=1,
                             info="建议根据CPU核心数设置"
                         )
+
+                        with gr.Accordion("框大小筛选（按面积过滤）", open=True):
+                            max_box_area = gr.Slider(
+                                label="最大框面积（像素²）",
+                                minimum=0,
+                                maximum=500000,
+                                value=1200,
+                                step=5000,
+                                info="超过此面积的框将被过滤（用于过滤大物体如树木）。设为0表示不限制。100000≈300x300像素"
+                            )
+                            min_box_area = gr.Slider(
+                                label="最小框面积（像素²）",
+                                minimum=0,
+                                maximum=10000,
+                                value=150,
+                                step=100,
+                                info="小于此面积的框将被过滤（用于过滤噪声）。设为0表示不限制。500≈22x22像素"
+                            )
+                            gr.Markdown("""
+                            **说明：**
+                            - 车辆的识别框通常较小（几百到几万像素）
+                            - 树木的识别框通常很大（几十万像素以上）
+                            - 通过设置最大面积可以过滤掉大的树木检测框
+                            - 通过设置最小面积可以过滤掉小的噪声
+                            """)
 
                         # 阶段2按钮
                         detect_items_btn = gr.Button("🔍 第二阶段：开始检测", variant="primary", size="lg")
@@ -887,10 +1015,15 @@ if __name__ == "__main__":
                             interactive=False
                         )
 
-                        json_download = gr.File(
-                            label="下载JSON文件",
-                            visible=False
-                        )
+                        with gr.Row():
+                            json_download = gr.File(
+                                label="下载JSON文件",
+                                visible=False
+                            )
+                            zip_download = gr.File(
+                                label="下载标注图片ZIP",
+                                visible=False
+                            )
 
                         video_gallery = gr.Gallery(
                             label="检测结果样本 (前5帧)",
@@ -932,9 +1065,11 @@ if __name__ == "__main__":
                         grounding_caption_video,
                         box_threshold_video,
                         text_threshold_video,
-                        num_workers
+                        num_workers,
+                        max_box_area,
+                        min_box_area
                     ],
-                    outputs=[json_output, video_gallery, stage_info_output, json_download]
+                    outputs=[json_output, video_gallery, stage_info_output, json_download, zip_download]
                 )
 
 
