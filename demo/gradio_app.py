@@ -330,6 +330,8 @@ def process_frame_detection(frame_info, grounding_caption, box_threshold, text_t
         filtered_logits = []
         filtered_phrases = []
         filtered_areas = []
+        # 保存框的详细信息（位置、尺寸）
+        filtered_box_details = []
 
         if boxes is not None and len(boxes) > 0:
             img_h, img_w = image_rgb.size[1], image_rgb.size[0]
@@ -338,10 +340,16 @@ def process_frame_detection(frame_info, grounding_caption, box_threshold, text_t
                 # box格式: [cx, cy, w, h] (归一化坐标)
                 cx, cy, bw, bh = box
 
-                # 计算实际像素面积
+                # 计算实际像素尺寸
                 box_w = bw * img_w
                 box_h = bh * img_h
                 box_area = box_w * box_h
+
+                # 计算实际像素坐标（左上角和右下角）
+                x1 = cx * img_w - box_w / 2
+                y1 = cy * img_h - box_h / 2
+                x2 = cx * img_w + box_w / 2
+                y2 = cy * img_h + box_h / 2
 
                 # 筛选条件
                 if max_box_area is not None and box_area > max_box_area:
@@ -353,6 +361,24 @@ def process_frame_detection(frame_info, grounding_caption, box_threshold, text_t
                 filtered_logits.append(logit)
                 filtered_phrases.append(phrase)
                 filtered_areas.append(box_area)
+
+                # 保存框的详细信息
+                filtered_box_details.append({
+                    # 归一化坐标 (0-1)
+                    "center_x": float(cx),
+                    "center_y": float(cy),
+                    "width_norm": float(bw),
+                    "height_norm": float(bh),
+                    # 实际像素坐标
+                    "x1": float(x1),
+                    "y1": float(y1),
+                    "x2": float(x2),
+                    "y2": float(y2),
+                    # 实际像素尺寸
+                    "width": float(box_w),
+                    "height": float(box_h),
+                    "area": float(box_area)
+                })
 
             # 转换为tensor
             if len(filtered_boxes) > 0:
@@ -386,9 +412,9 @@ def process_frame_detection(frame_info, grounding_caption, box_threshold, text_t
                 {
                     "label": phrase,
                     "confidence": float(logit),
-                    "area": float(area) if filtered_areas else None
+                    **box_details
                 }
-                for phrase, logit, area in zip(filtered_phrases, filtered_logits, filtered_areas)
+                for phrase, logit, box_details in zip(filtered_phrases, filtered_logits, filtered_box_details)
             ],
             "annotated_image": Image.fromarray(image_with_box)
         }
