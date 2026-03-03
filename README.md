@@ -1,3 +1,7 @@
+### 启动命令
+'''
+python demo\gradio_app.py
+'''
 <div align="center">
   <img src="./.asset/grounding_dino_logo.png" width="30%">
 </div>

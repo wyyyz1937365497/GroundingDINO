@@ -8,3 +8,6 @@ numpy
 opencv-python
 supervision>=0.22.0
 pycocotools
+packaging
+gradio==3.50.2
+ffmpeg-python
