@@ -921,28 +921,28 @@ if __name__ == "__main__":
                                 label="裁剪宽度",
                                 minimum=100,
                                 maximum=1920,
-                                value=300,
+                                value=550,
                                 step=10
                             )
                             crop_height = gr.Slider(
                                 label="裁剪高度",
                                 minimum=100,
                                 maximum=1920,
-                                value=300,
+                                value=870,
                                 step=10
                             )
                             crop_x = gr.Slider(
                                 label="裁剪起始X",
                                 minimum=0,
                                 maximum=1920,
-                                value=1080,
+                                value=910,
                                 step=10
                             )
                             crop_y = gr.Slider(
                                 label="裁剪起始Y",
                                 minimum=0,
                                 maximum=1920,
-                                value=1320,
+                                value=530,
                                 step=10
                             )
 
@@ -1099,4 +1099,4 @@ if __name__ == "__main__":
                 )
 
 
-    block.launch(server_name='0.0.0.0', server_port=7579, debug=args.debug, share=args.share)
+    block.launch(server_name='0.0.0.0', server_port=19555, debug=args.debug, share=False)
