@@ -64,6 +64,82 @@ import groundingdino.datasets.transforms as T
 from huggingface_hub import hf_hub_download
 
 
+# ========== 资源监控 ==========
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("警告: psutil 未安装，无法监控内存使用。安装方法: pip install psutil")
+
+
+class ResourceMonitor:
+    """资源监控器，用于跟踪内存和显存的峰值使用量"""
+
+    def __init__(self):
+        self.peak_ram_mb = 0
+        self.peak_gpu_mb = 0
+        self.lock = threading.Lock()
+
+    def get_ram_usage_mb(self):
+        """获取当前RAM使用量（MB）"""
+        if PSUTIL_AVAILABLE:
+            process = psutil.Process(os.getpid())
+            return process.memory_info().rss / 1024 / 1024
+        else:
+            # 备用方案：使用torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            return 0
+
+    def get_gpu_usage_mb(self):
+        """获取当前GPU显存使用量（MB）"""
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_allocated() / 1024 / 1024
+            reserved = torch.cuda.memory_reserved() / 1024 / 1024
+            return max(allocated, reserved)
+        return 0
+
+    def update_peak(self):
+        """更新峰值记录"""
+        with self.lock:
+            ram = self.get_ram_usage_mb()
+            gpu = self.get_gpu_usage_mb()
+
+            if ram > self.peak_ram_mb:
+                self.peak_ram_mb = ram
+            if gpu > self.peak_gpu_mb:
+                self.peak_gpu_mb = gpu
+
+    def get_peak_stats(self):
+        """获取峰值统计信息"""
+        with self.lock:
+            return {
+                "peak_ram_mb": self.peak_ram_mb,
+                "peak_gpu_mb": self.peak_gpu_mb
+            }
+
+    def format_size(self, size_mb):
+        """格式化大小显示"""
+        if size_mb >= 1024:
+            return f"{size_mb / 1024:.2f} GB"
+        return f"{size_mb:.2f} MB"
+
+    def get_summary(self):
+        """获取峰值摘要"""
+        stats = self.get_peak_stats()
+        return (
+            f"📊 资源使用峰值:\n"
+            f"  RAM: {self.format_size(stats['peak_ram_mb'])}\n"
+            f"  GPU: {self.format_size(stats['peak_gpu_mb'])}"
+        )
+
+
+# 全局资源监控器
+resource_monitor = ResourceMonitor()
+
+
 # Use this command for evaluate the Grounding DINO model
 config_file = "groundingdino/config/GroundingDINO_SwinT_OGC.py"
 ckpt_repo_id = "ShilongLiu/GroundingDINO"
@@ -309,6 +385,9 @@ def process_frame_detection(frame_info, grounding_caption, box_threshold, text_t
     frame_idx, image, timestamp = frame_info
 
     try:
+        # 更新资源监控
+        resource_monitor.update_peak()
+
         # 转换为RGB
         image_rgb = image.convert("RGB")
 
@@ -324,6 +403,9 @@ def process_frame_detection(frame_info, grounding_caption, box_threshold, text_t
             text_threshold,
             device=DEVICE
         )
+
+        # 更新资源监控（检测后）
+        resource_monitor.update_peak()
 
         # 按框大小筛选
         filtered_boxes = []
@@ -645,8 +727,15 @@ def detect_items_stage(
                 progress_val = min(completed / total_to_process, 1.0)
                 progress(progress_val, desc=f"检测完成 {completed}/{total_to_process}")
 
+                # 每处理10帧更新一次资源监控
+                if completed % 10 == 0:
+                    resource_monitor.update_peak()
+
         # 按帧号排序
         results.sort(key=lambda x: x["frame"])
+
+        # 获取峰值资源使用统计
+        resource_stats = resource_monitor.get_peak_stats()
 
         # 获取视频名称和时间戳
         video_name = Path(video_path).stem
@@ -741,6 +830,12 @@ def detect_items_stage(
                 "total_items_detected": sum(r["count"] for r in results),
                 "average_items_per_frame": sum(r["count"] for r in results) / len(results) if results else 0
             },
+            "resource_usage": {
+                "peak_ram_mb": round(resource_stats["peak_ram_mb"], 2),
+                "peak_gpu_mb": round(resource_stats["peak_gpu_mb"], 2),
+                "peak_ram_gb": round(resource_stats["peak_ram_mb"] / 1024, 2),
+                "peak_gpu_gb": round(resource_stats["peak_gpu_mb"] / 1024, 2)
+            },
             "results": results_for_json
         }
 
@@ -760,6 +855,8 @@ def detect_items_stage(
         avg_count = output_data["statistics"]["average_items_per_frame"]
 
         zip_info = f"\n✓ ZIP文件已保存:\n{zip_filepath}" if zip_filepath else ""
+        resource_summary = resource_monitor.get_summary()
+
         info_text = (
             f"✓ 检测完成!\n"
             f"视频信息: {stage_data['total_frames']}帧, {fps}fps, {stage_data['duration']:.1f}秒\n"
@@ -769,6 +866,7 @@ def detect_items_stage(
             f"并行线程: {num_workers}\n"
             f"总检测数量: {total_detected}\n"
             f"平均每帧: {avg_count:.1f}个\n"
+            f"\n{resource_summary}\n"
             f"\n✓ JSON已保存:\n{json_filepath}\n"
             f"✓ 标注图片已保存:\n{annotated_images_dir}\n"
             f"共 {len(annotated_images_paths)} 张图片"

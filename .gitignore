@@ -8,14 +8,22 @@ __pycache__/
 *$py.class
 *.mp4
 # C extensions
+mediamtx_v1.16.3_windows_amd64/
+is3数据上传要求.md
 *.so
 *.pth
 # Distribution / packaging
 .Python
 build/
 develop-eggs/
+mediamtx/
 dist/
 downloads/
+iS3数据文件要求.md
+start_rtsp_server.py
+test_rtsp_client.py
+RTSP_README.md
+iS3数据文件设计.md
 eggs/
 .eggs/
 lib/
