@@ -11,3 +11,4 @@ pycocotools
 packaging
 gradio==3.50.2
 ffmpeg-python
+requests

@@ -18,6 +18,9 @@ import signal
 import sys
 import subprocess
 import os
+from typing import Optional
+
+from is3_metadata_api import MetadataAPI
 
 # 配置日志
 logging.basicConfig(
@@ -40,7 +43,7 @@ else:
 # ========== 配置参数 ==========
 CONFIG = {
     # RTSP 配置
-    "rtsp_url": "rtsp://127.0.0.1:19345/video",
+    "rtsp_url": "",
 
     # 裁剪参数
     "crop_width": 550,
@@ -59,7 +62,7 @@ CONFIG = {
     "min_box_area": 150,
 
     # 采样间隔（秒）
-    "sample_interval": 10,
+    "sample_interval": 30,
 
     # 输出目录
     "output_dir": "output/rtsp_detection",
@@ -68,7 +71,22 @@ CONFIG = {
     "temp_frame_path": "temp_rtsp_frame.jpg",
 
     # 设备
-    "device": "cuda" if torch.cuda.is_available() else "cpu"
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+
+    # iS3 上报配置
+    "is3": {
+        "enabled": True,
+        "base_url": "https://server.is3.net.cn",
+        "file_base_url": "https://file.is3.net.cn",
+        "project_id": os.getenv("IS3_PROJECT_ID", ""),
+        "access_key": os.getenv("IS3_ACCESS_KEY", ""),
+        "secret_key": os.getenv("IS3_SECRET_KEY", ""),
+        "folder_id": os.getenv("IS3_FOLDER_ID", ""),
+        "camera_code": "衷和楼1702",
+        "detail_table_code": "camera_result_detail",
+        "simple_table_code": "camera_result_simple",
+        "timeout": 20
+    }
 }
 
 
@@ -135,6 +153,126 @@ class ResourceMonitor:
 
 
 resource_monitor = ResourceMonitor()
+
+
+class IS3Client:
+    """iS3 文件上传和元数据写入客户端"""
+
+    def __init__(self, config: dict):
+        self.enabled = bool(config.get("enabled", False))
+        self.base_url = str(config.get("base_url", "")).rstrip("/")
+        self.file_base_url = str(config.get("file_base_url", "")).rstrip("/")
+        self.project_id = str(config.get("project_id", ""))
+        self.access_key = str(config.get("access_key", ""))
+        self.secret_key = str(config.get("secret_key", ""))
+        self.folder_id = str(config.get("folder_id", ""))
+        self.camera_code = str(config.get("camera_code", "衷和楼1702"))
+        self.detail_table_code = str(config.get("detail_table_code", "camera_result_detail"))
+        self.simple_table_code = str(config.get("simple_table_code", "camera_result_simple"))
+        self.timeout = int(config.get("timeout", 20))
+        self.api = MetadataAPI(
+            base_url=self.base_url,
+            prj_id=self.project_id,
+            headers={
+                "X-Access-Key": self.access_key,
+                "X-Secret-Key": self.secret_key,
+            },
+            folder_id=self.folder_id,
+            file_base_url=self.file_base_url,
+            timeout=self.timeout,
+        )
+
+    def is_available(self) -> bool:
+        return all([
+            self.enabled,
+            self.base_url,
+            self.project_id,
+            self.access_key,
+            self.secret_key,
+            self.detail_table_code,
+            self.simple_table_code,
+        ])
+
+    def upload_file(self, file_path: str) -> Optional[str]:
+        if not self.folder_id:
+            logger.warning("iS3 folder_id 未配置，跳过文件上传")
+            return None
+
+        if not file_path or not os.path.exists(file_path):
+            logger.warning(f"待上传文件不存在: {file_path}")
+            return None
+
+        try:
+            result = self.api.upload_file(file_path)
+            if isinstance(result, dict) and result.get("success", False):
+                file_data = result.get("data") or {}
+                rel_url = file_data.get("url")
+                if rel_url:
+                    return f"{self.file_base_url}{rel_url}"
+                logger.warning(f"iS3 上传成功但缺少 data.url: {result}")
+                return None
+
+            logger.warning(f"iS3 文件上传失败: {result}")
+            return None
+        except Exception as e:
+            logger.warning(f"iS3 文件上传异常: {e}")
+            return None
+
+    def check_folder_access(self) -> bool:
+        if not self.folder_id:
+            return False
+        try:
+            result = self.api.get_file_list(self.folder_id, page_num=1, page_size=1)
+            if isinstance(result, dict) and result.get("code") == 200:
+                logger.info("iS3 目录校验成功")
+                return True
+            logger.warning(f"iS3 目录校验失败: {result}")
+            return False
+        except Exception as e:
+            logger.warning(f"iS3 目录校验异常: {e}")
+            return False
+
+    def add_data(self, meta_table_code: str, row: dict) -> bool:
+        try:
+            result = self.api.insert_data(meta_table_code, [row])
+            if isinstance(result, dict) and result.get("success", False):
+                return True
+            logger.warning(f"iS3 写入失败: table={meta_table_code}, resp={result}")
+            return False
+        except Exception as e:
+            logger.warning(f"iS3 写入异常: table={meta_table_code}, err={e}")
+            return False
+
+    def upload_detection_result(self, latest_result: dict) -> bool:
+        timestamp_text = latest_result.get("timestamp") or datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        detections = latest_result.get("detections") or []
+        detection_count = int(latest_result.get("detection_count", len(detections)))
+
+        image_path = latest_result.get("annotated_image") or latest_result.get("cropped_image")
+        camera_img_value = self.upload_file(image_path) if image_path else None
+
+        detail_row = {
+            "camera_code": self.camera_code,
+            "camera_time": timestamp_text,
+            "camera_img": camera_img_value,
+            "result_json": json.dumps(detections, ensure_ascii=False),
+            "result_num": detection_count
+        }
+
+        simple_row = {
+            "camera_code": self.camera_code,
+            "camera_time": timestamp_text,
+            "camera_result": detection_count
+        }
+
+        detail_ok = self.add_data(self.detail_table_code, detail_row)
+        simple_ok = self.add_data(self.simple_table_code, simple_row)
+
+        if not detail_ok:
+            logger.warning("iS3 写入失败: camera_result_detail")
+        if not simple_ok:
+            logger.warning("iS3 写入失败: camera_result_simple")
+        return detail_ok and simple_ok
 
 
 # ========== 模型加载 ==========
@@ -383,6 +521,13 @@ def main():
     global running, frame_count, detection_count, total_detected_items
 
     logger.info("=" * 60)
+
+    is3_client = IS3Client(CONFIG.get("is3", {}))
+    if is3_client.is_available():
+        logger.info("iS3 上报已启用")
+        is3_client.check_folder_access()
+    else:
+        logger.warning("iS3 上报未完整配置，将跳过上传")
     logger.info("RTSP 视频流检测服务")
     logger.info("=" * 60)
 
@@ -594,6 +739,14 @@ def main():
                 with open(json_path, 'r', encoding='utf-8') as f:
                     latest_result = json.load(f)
                 update_summary_json(CONFIG["output_dir"], latest_result)
+
+                # 上传到 iS3 平台
+                if is3_client.is_available():
+                    is3_ok = is3_client.upload_detection_result(latest_result)
+                    if is3_ok:
+                        logger.info("  iS3 上传成功（文件 + 元数据）")
+                    else:
+                        logger.warning("  iS3 上传部分或全部失败")
 
                 # 输出结果
                 if detections:
