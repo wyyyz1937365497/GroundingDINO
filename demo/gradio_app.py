@@ -14,6 +14,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import sys
 import logging
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
 try:
     import ffmpeg
@@ -139,11 +141,1033 @@ class ResourceMonitor:
 # 全局资源监控器
 resource_monitor = ResourceMonitor()
 
+# ========== 图像配准模块 ==========
+try:
+    # 尝试导入项目根目录的 image_registration 模块
+    import sys
+    root_path = Path(__file__).resolve().parents[1]
+    if str(root_path) not in sys.path:
+        sys.path.insert(0, str(root_path))
+
+    from image_registration import ImageRegistration, OffsetSmoother, DinoTreeGridRegistration, analyze_grid_pattern, find_main_tree_cluster
+    IMAGE_REGISTRATION_AVAILABLE = True
+except ImportError as e:
+    IMAGE_REGISTRATION_AVAILABLE = False
+    DinoTreeGridRegistration = None
+    print(f"警告: 图像配准模块不可用: {e}")
+
+# 检查scipy是否可用（用于网格配准）
+try:
+    from scipy.spatial.distance import cdist
+    from scipy.optimize import linear_sum_assignment
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    linear_sum_assignment = None
+    print("警告: scipy未安装，网格配准功能不可用")
+
+# ========== 配置标记工具 ==========
+
+CONFIGS_DIR = Path(__file__).resolve().parents[1] / "configs"
+CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class CameraConfigManager:
+    """相机配置管理器"""
+
+    def __init__(self):
+        self.current_config: Dict = {}
+        self.reference_image: Optional[np.ndarray] = None
+        self.landmark_points: List[Dict] = []
+        self.detection_regions: List[Dict] = []
+
+    def reset(self):
+        """重置配置"""
+        self.current_config = {}
+        self.reference_image = None
+        self.landmark_points = []
+        self.detection_regions = []
+
+    def to_dict(self) -> Dict:
+        """转换为字典格式"""
+        registration_method = self.current_config.get("registration_method", "DINO_TREE_GRID")
+
+        # 基础注册配置
+        registration_config = {
+            "enabled": True,
+            "method": registration_method,
+            "smoothing_window": self.current_config.get("smoothing_window", 5)
+        }
+
+        # 如果是 DINO 树木网格配准，添加额外参数
+        if registration_method == "DINO_TREE_GRID":
+            registration_config.update({
+                "caption": self.current_config.get("dino_caption", "tree"),
+                "box_threshold": self.current_config.get("dino_box_threshold", 0.3),
+                "text_threshold": self.current_config.get("dino_text_threshold", 0.25),
+                "device": self.current_config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+            })
+
+        return {
+            "version": "1.0",
+            "camera_name": self.current_config.get("camera_name", ""),
+            "created_at": datetime.now().strftime('%Y-%m-%dT%H:%M:%S'),
+            "registration": registration_config,
+            "detection_regions": self.detection_regions,
+            "rtsp_settings": {
+                "url": self.current_config.get("rtsp_url", ""),
+                "sample_interval": self.current_config.get("sample_interval", 30),
+                "output_dir": self.current_config.get("output_dir", "output/rtsp_detection")
+            }
+        }
+
+
+# 全局配置管理器
+config_manager = CameraConfigManager()
+
+
+def list_config_files() -> List[str]:
+    """列出所有配置文件"""
+    config_files = []
+    if CONFIGS_DIR.exists():
+        for f in CONFIGS_DIR.glob("*.json"):
+            config_files.append(str(f))
+    return sorted(config_files)
+
+
+def load_reference_image(image_upload) -> Tuple[str, str, np.ndarray]:
+    """
+    加载参考图像
+
+    Args:
+        image_upload: 上传的图像文件 (PIL Image from Gradio with type="pil")
+
+    Returns:
+        (信息文本, 图像路径, 图像数组)
+    """
+    if image_upload is None:
+        return "请上传参考图像", None, None
+
+    try:
+        # 保存参考图像
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        ref_image_path = CONFIGS_DIR / f"reference_image_{timestamp}.jpg"
+
+        # Gradio with type="pil" returns a PIL Image object directly
+        if isinstance(image_upload, Image.Image):
+            # PIL Image from Gradio
+            image = image_upload
+            image.save(ref_image_path)
+            image_np = np.array(image)
+        elif isinstance(image_upload, str):
+            # 文件路径字符串
+            image = Image.open(image_upload)
+            image.save(ref_image_path)
+            image_np = np.array(image)
+        elif hasattr(image_upload, 'name'):
+            # 上传的文件对象
+            image = Image.open(image_upload.name)
+            image.save(ref_image_path)
+            image_np = np.array(image)
+        elif isinstance(image_upload, np.ndarray):
+            # numpy array
+            image = Image.fromarray(image_upload)
+            image.save(ref_image_path)
+            image_np = image_upload
+        else:
+            # 其他类型，尝试转换为numpy再转PIL
+            image_np = np.array(image_upload)
+            image = Image.fromarray(image_np)
+            image.save(ref_image_path)
+
+        # 转换为BGR格式（OpenCV格式）
+        if len(image_np.shape) == 3 and image_np.shape[2] == 3:
+            image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+
+        config_manager.reference_image = image_np
+        config_manager.current_config["reference_image_path"] = str(ref_image_path)
+
+        # 初始化图像配准器
+        if IMAGE_REGISTRATION_AVAILABLE:
+            registration_method = config_manager.current_config.get("registration_method", "DINO_TREE_GRID")
+
+            if registration_method == "DINO_TREE_GRID":
+                if not SCIPY_AVAILABLE:
+                    info = f"⚠️ scipy未安装，无法使用 DINO 树木网格配准\n路径: {ref_image_path}\n尺寸: {image_np.shape[1]}x{image_np.shape[0]}\n请安装: pip install scipy"
+                    return info, str(ref_image_path), cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+
+                # 使用全局加载的 DINO 模型
+                reg_config = {
+                    "caption": config_manager.current_config.get("dino_caption", "tree"),
+                    "box_threshold": config_manager.current_config.get("dino_box_threshold", 0.3),
+                    "text_threshold": config_manager.current_config.get("dino_text_threshold", 0.25),
+                    "expected_rows": config_manager.current_config.get("grid_rows", 3),
+                    "expected_cols": config_manager.current_config.get("grid_cols", 4),
+                    "device": config_manager.current_config.get("device", DEVICE),
+                    "smoothing_window": config_manager.current_config.get("smoothing_window", 5)
+                }
+                config_manager.registration = DinoTreeGridRegistration(model=model, config=reg_config)
+                success = config_manager.registration.set_reference_image(image_np)
+
+                if success:
+                    # 获取检测到的树木数量
+                    if hasattr(config_manager.registration, 'reference_trees') and config_manager.registration.reference_trees:
+                        detected_count = len(config_manager.registration.reference_trees)
+                        grid_count = len(config_manager.registration.reference_grid_points) if config_manager.registration.reference_grid_points is not None else 0
+                        info = f"✓ 参考图像已加载（DINO 树木网格模式）\n路径: {ref_image_path}\n尺寸: {image_np.shape[1]}x{image_np.shape[0]}\n检测到树木: {detected_count} 棵\n识别网格点: {grid_count} 个\n网格配置: {reg_config['expected_rows']}x{reg_config['expected_cols']}"
+                    else:
+                        info = f"✓ 参考图像已加载（DINO 树木网格模式）\n路径: {ref_image_path}\n尺寸: {image_np.shape[1]}x{image_np.shape[0]}"
+                else:
+                    info = f"⚠️ 参考图像加载失败（DINO 树木网格模式）\n路径: {ref_image_path}"
+
+            else:
+                info = f"✓ 参考图像已加载\n路径: {ref_image_path}\n尺寸: {image_np.shape[1]}x{image_np.shape[0]}"
+        else:
+            info = f"✓ 参考图像已加载\n路径: {ref_image_path}\n尺寸: {image_np.shape[1]}x{image_np.shape[0]}"
+
+        return info, str(ref_image_path), cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+
+    except Exception as e:
+        return f"加载参考图像失败: {e}", None, None
+
+
+def add_landmark_point(evt: gr.SelectData, current_image, landmark_points_json: str) -> Tuple[str, np.ndarray, str]:
+    """
+    添加标识物标记点
+
+    Args:
+        evt: Gradio选择事件
+        current_image: 当前显示的图像
+        landmark_points_json: 现有标记点JSON
+
+    Returns:
+        (信息文本, 标注后的图像, 更新后的标记点JSON)
+    """
+    if current_image is None:
+        return "请先加载参考图像", None, landmark_points_json
+
+    try:
+        # 解析现有标记点
+        if landmark_points_json:
+            landmark_points = json.loads(landmark_points_json)
+        else:
+            landmark_points = []
+
+        # 添加新标记点
+        new_point = {
+            "id": len(landmark_points) + 1,
+            "x": evt.index[0],  # x坐标
+            "y": evt.index[1],  # y坐标
+            "label": f"标记{len(landmark_points) + 1}"
+        }
+        landmark_points.append(new_point)
+        config_manager.landmark_points = landmark_points
+
+        # 更新图像配准器
+        if IMAGE_REGISTRATION_AVAILABLE and hasattr(config_manager, 'registration'):
+            config_manager.registration.set_reference_image(config_manager.reference_image, landmark_points)
+
+        # 绘制标记点
+        marked_image = current_image.copy()
+        for pt in landmark_points:
+            x, y = int(pt["x"]), int(pt["y"])
+            cv2.circle(marked_image, (x, y), 10, (0, 255, 0), 2)
+            cv2.circle(marked_image, (x, y), 5, (0, 0, 255), -1)
+            cv2.putText(marked_image, f"#{pt['id']}", (x - 20, y - 15),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+            cv2.putText(marked_image, pt.get("label", ""), (x + 15, y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        updated_json = json.dumps(landmark_points, ensure_ascii=False)
+        info = f"✓ 已添加标记点 #{new_point['id']} at ({new_point['x']}, {new_point['y']})\n总标记点数: {len(landmark_points)}"
+
+        return info, marked_image, updated_json
+
+    except Exception as e:
+        return f"添加标记点失败: {e}", current_image, landmark_points_json
+
+
+def preview_crop_area(reference_image, crop_width: int, crop_height: int,
+                      crop_x: int, crop_y: int) -> Tuple[np.ndarray, str]:
+    """
+    在参考图像上预览裁剪区域
+
+    Args:
+        reference_image: 参考图像
+        crop_width: 裁剪宽度
+        crop_height: 裁剪高度
+        crop_x: 裁剪起始X
+        crop_y: 裁剪起始Y
+
+    Returns:
+        (带裁剪框的图像, 预览信息文本)
+    """
+    if reference_image is None:
+        return None, "请先加载参考图像"
+
+    try:
+        # 转换图像格式
+        if isinstance(reference_image, Image.Image):
+            image_np = np.array(reference_image)
+        else:
+            image_np = reference_image
+
+        # 转换为BGR格式
+        if len(image_np.shape) == 3 and image_np.shape[2] == 3:
+            image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+        else:
+            image_bgr = image_np
+
+        h, w = image_bgr.shape[:2]
+
+        # 确保裁剪区域在图像范围内
+        crop_x_clamped = min(crop_x, w - crop_width)
+        crop_y_clamped = min(crop_y, h - crop_height)
+        crop_x_clamped = max(0, crop_x_clamped)
+        crop_y_clamped = max(0, crop_y_clamped)
+
+        # 调整裁剪尺寸以适应图像边界
+        actual_width = min(crop_width, w - crop_x_clamped)
+        actual_height = min(crop_height, h - crop_y_clamped)
+
+        # 绘制裁剪区域
+        vis_image = image_bgr.copy()
+
+        # 绘制半透明填充
+        overlay = vis_image.copy()
+        cv2.rectangle(overlay,
+                     (crop_x_clamped, crop_y_clamped),
+                     (crop_x_clamped + actual_width, crop_y_clamped + actual_height),
+                     (0, 255, 0), -1)
+        cv2.addWeighted(overlay, 0.2, vis_image, 0.8, 0, vis_image)
+
+        # 绘制边框
+        cv2.rectangle(vis_image,
+                     (crop_x_clamped, crop_y_clamped),
+                     (crop_x_clamped + actual_width, crop_y_clamped + actual_height),
+                     (0, 255, 0), 3)
+
+        # 绘制四个角的标记
+        corner_length = 20
+        # 左上角
+        cv2.line(vis_image, (crop_x_clamped, crop_y_clamped),
+                (crop_x_clamped + corner_length, crop_y_clamped), (0, 0, 255), 3)
+        cv2.line(vis_image, (crop_x_clamped, crop_y_clamped),
+                (crop_x_clamped, crop_y_clamped + corner_length), (0, 0, 255), 3)
+        # 右上角
+        cv2.line(vis_image, (crop_x_clamped + actual_width, crop_y_clamped),
+                (crop_x_clamped + actual_width - corner_length, crop_y_clamped), (0, 0, 255), 3)
+        cv2.line(vis_image, (crop_x_clamped + actual_width, crop_y_clamped),
+                (crop_x_clamped + actual_width, crop_y_clamped + corner_length), (0, 0, 255), 3)
+        # 左下角
+        cv2.line(vis_image, (crop_x_clamped, crop_y_clamped + actual_height),
+                (crop_x_clamped + corner_length, crop_y_clamped + actual_height), (0, 0, 255), 3)
+        cv2.line(vis_image, (crop_x_clamped, crop_y_clamped + actual_height),
+                (crop_x_clamped, crop_y_clamped + actual_height - corner_length), (0, 0, 255), 3)
+        # 右下角
+        cv2.line(vis_image, (crop_x_clamped + actual_width, crop_y_clamped + actual_height),
+                (crop_x_clamped + actual_width - corner_length, crop_y_clamped + actual_height), (0, 0, 255), 3)
+        cv2.line(vis_image, (crop_x_clamped + actual_width, crop_y_clamped + actual_height),
+                (crop_x_clamped + actual_width, crop_y_clamped + actual_height - corner_length), (0, 0, 255), 3)
+
+        # 添加尺寸标注
+        info_text = f"{actual_width}x{actual_height}"
+        cv2.putText(vis_image, info_text,
+                   (crop_x_clamped + 5, crop_y_clamped + 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        # 添加坐标标注
+        coord_text = f"({crop_x_clamped}, {crop_y_clamped})"
+        cv2.putText(vis_image, coord_text,
+                   (crop_x_clamped + 5, crop_y_clamped + actual_height - 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+        # 转换为RGB用于显示
+        vis_rgb = cv2.cvtColor(vis_image, cv2.COLOR_BGR2RGB)
+
+        # 构建信息文本
+        info_lines = [
+            f"✓ 裁剪区域预览",
+            f"  图像尺寸: {w}x{h}",
+            f"  设定裁剪: x={crop_x}, y={crop_y}, w={crop_width}, h={crop_height}",
+            f"  实际裁剪: x={crop_x_clamped}, y={crop_y_clamped}, w={actual_width}, h={actual_height}"
+        ]
+
+        if crop_x != crop_x_clamped or crop_y != crop_y_clamped:
+            info_lines.append("  ⚠️ 裁剪起点超出图像边界，已自动调整")
+
+        if actual_width != crop_width or actual_height != crop_height:
+            info_lines.append("  ⚠️ 裁剪尺寸超出图像边界，已自动调整")
+
+        return vis_rgb, "\n".join(info_lines)
+
+    except Exception as e:
+        import traceback
+        return None, f"预览失败: {e}\n{traceback.format_exc()}"
+
+
+def visualize_detected_features(reference_image, nfeatures: int = 500, method: str = "ORB") -> Tuple[np.ndarray, str]:
+    """
+    可视化图像中检测到的特征点（用于调试配准）
+
+    Args:
+        reference_image: 参考图像
+        nfeatures: 特征点数量
+        method: 配准方法 (ORB 或 SIFT)
+
+    Returns:
+        (特征点可视化图像, 信息文本)
+    """
+    if reference_image is None:
+        return None, "请先加载参考图像"
+
+    if not IMAGE_REGISTRATION_AVAILABLE:
+        return None, "图像配准模块不可用"
+
+    try:
+        # 转换图像格式
+        if isinstance(reference_image, Image.Image):
+            image_np = np.array(reference_image)
+        else:
+            image_np = reference_image
+
+        # 转换为BGR格式
+        if len(image_np.shape) == 3 and image_np.shape[2] == 3:
+            image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+        else:
+            image_bgr = image_np
+
+        # 转换为灰度图
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+        # 创建特征检测器
+        if method == "ORB":
+            detector = cv2.ORB_create(nfeatures=nfeatures)
+        elif method == "SIFT":
+            detector = cv2.SIFT_create(nfeatures=nfeatures if nfeatures > 0 else None)
+        else:
+            return None, f"不支持的配准方法: {method}"
+
+        # 检测特征点
+        keypoints, descriptors = detector.detectAndCompute(gray, None)
+
+        # 绘制特征点
+        # 兼容不同OpenCV版本的常量名
+        try:
+            flags = cv2.DRAW_MATCHES_FLAGS_RICH_KEYPOINTS
+        except AttributeError:
+            try:
+                flags = cv2.DrawMatchesFlags_RICH_KEYPOINTS
+            except AttributeError:
+                flags = 4  # RICH_KEYPOINTS 的值
+
+        vis_image = cv2.drawKeypoints(
+            image_bgr,
+            keypoints,
+            None,
+            flags=flags
+        )
+
+        # 转换为RGB用于显示
+        vis_rgb = cv2.cvtColor(vis_image, cv2.COLOR_BGR2RGB)
+
+        # 计算特征点分布
+        h, w = gray.shape
+        quadrants = {
+            "左上": sum(1 for kp in keypoints if kp.pt[0] < w/2 and kp.pt[1] < h/2),
+            "右上": sum(1 for kp in keypoints if kp.pt[0] >= w/2 and kp.pt[1] < h/2),
+            "左下": sum(1 for kp in keypoints if kp.pt[0] < w/2 and kp.pt[1] >= h/2),
+            "右下": sum(1 for kp in keypoints if kp.pt[0] >= w/2 and kp.pt[1] >= h/2)
+        }
+
+        # 构建信息文本
+        info_lines = [
+            f"=== 特征点检测分析 ===",
+            f"检测方法: {method}",
+            f"特征点数量: {len(keypoints)}",
+            f"图像尺寸: {w}x{h}",
+            f"描述符维度: {descriptors.shape[0] if descriptors is not None else 0} x {descriptors.shape[1] if descriptors is not None else 'N/A'}",
+            "",
+            "特征点分布:",
+            f"  左上区域: {quadrants['左上']} 个",
+            f"  右上区域: {quadrants['右上']} 个",
+            f"  左下区域: {quadrants['左下']} 个",
+            f"  右下区域: {quadrants['右下']} 个",
+            "",
+            "💡 提示:",
+            "  - 绿色圆圈 = 检测到的特征点",
+            "  - 圆圈大小 = 特征尺度",
+            "  - 圆圈方向 = 特征方向",
+            "",
+            "建议选择特征点密集区域的固定物体作为标识物"
+        ]
+
+        return vis_rgb, "\n".join(info_lines)
+
+    except Exception as e:
+        import traceback
+        return None, f"特征检测失败: {e}\n{traceback.format_exc()}"
+
+
+def detect_tree_cluster_center(test_image, dino_caption: str, box_threshold: float, text_threshold: float) -> Tuple[Optional[np.ndarray], str, int, int]:
+    """
+    检测图像中的树集群中心点（简化版，用于配置）
+
+    Args:
+        test_image: 输入图像
+        dino_caption: DINO 检测文本提示
+        box_threshold: 框置信度阈值
+        text_threshold: 文本阈值
+
+    Returns:
+        (检测结果可视化图像, 信息文本, 中心点X, 中心点Y)
+    """
+    if test_image is None:
+        return None, "请先上传图像", 0, 0
+
+    if not IMAGE_REGISTRATION_AVAILABLE:
+        return None, "图像配准模块不可用", 0, 0
+
+    try:
+        # 转换图像格式
+        if isinstance(test_image, Image.Image):
+            image_np = np.array(test_image)
+        else:
+            image_np = test_image
+
+        # 转换为BGR格式
+        if len(image_np.shape) == 3 and image_np.shape[2] == 3:
+            image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+        else:
+            image_bgr = image_np
+
+        # 使用简化的检测函数
+        from image_registration import detect_tree_cluster_center
+        cluster_result = detect_tree_cluster_center(
+            model=model,
+            image=image_bgr,
+            caption=dino_caption,
+            box_threshold=box_threshold,
+            text_threshold=text_threshold,
+            device=DEVICE
+        )
+
+        if cluster_result is None:
+            return None, "未检测到树集群，请调整检测参数", 0, 0
+
+        center = cluster_result["center"]
+        bbox = cluster_result["bbox"]
+        padding_bbox = cluster_result["padding_bbox"]
+
+        # 创建可视化图像
+        vis_image = image_bgr.copy()
+
+        # 绘制红色半透明遮罩
+        overlay = vis_image.copy()
+        x1, y1, x2, y2 = padding_bbox
+        h, w = vis_image.shape[:2]
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 255), -1)
+        cv2.addWeighted(overlay, 0.3, vis_image, 0.7, 0, vis_image)
+
+        # 绘制边界框边线
+        cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 0, 255), 3)
+
+        # 绘制中心点（红色大圆点）
+        cv2.circle(vis_image, center, 25, (0, 0, 255), -1)
+        cv2.putText(vis_image, f"CENTER ({center[0]}, {center[1]})", (center[0] - 80, center[1] - 40),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+        # 绘制十字线
+        cv2.line(vis_image, (center[0], 0), (center[0], h), (0, 0, 255), 1)
+        cv2.line(vis_image, (0, center[1]), (w, center[1]), (0, 0, 255), 1)
+
+        # 转换为RGB用于显示
+        vis_rgb = cv2.cvtColor(vis_image, cv2.COLOR_BGR2RGB)
+
+        # 构建信息文本
+        info_lines = [
+            f"=== 树集群中心点检测成功 ===",
+            f"中心点坐标: ({center[0]}, {center[1]})",
+            f"检测到树木总数: {cluster_result['tree_count']} 棵",
+            f"群集中树木数: {cluster_result['cluster_tree_count']} 棵",
+            f"群集边界框: [{bbox[0]}, {bbox[1]}, {bbox[2]}, {bbox[3]}]",
+            f"扩展边界框: [{padding_bbox[0]}, {padding_bbox[1]}, {padding_bbox[2]}, {padding_bbox[3]}]",
+            f"图像尺寸: {cluster_result['image_size'][0]}x{cluster_result['image_size'][1]}",
+            "",
+            "💡 说明:",
+            "  - 红色圆点 = 检测到的树集群中心点",
+            "  - 红色半透明遮罩 = 树木群集区域",
+            "  - 十字线 = 中心点定位线",
+            "",
+            "配置区域时，裁剪参数将相对于此中心点计算：",
+            "  - 绝对X = 中心点X + 相对偏移X",
+            "  - 绝对Y = 中心点Y + 相对偏移Y"
+        ]
+
+        return vis_rgb, "\n".join(info_lines), center[0], center[1]
+
+    except Exception as e:
+        import traceback
+        return None, f"检测失败: {e}\n{traceback.format_exc()}", 0, 0
+
+
+def preview_current_region_on_image(test_image, region_name: str, region_id: str,
+                                     crop_width: int, crop_height: int, relative_x: int, relative_y: int,
+                                     center_x: int, center_y: int) -> Tuple[Optional[np.ndarray], str]:
+    """
+    预览当前正在配置的单个区域在图像上的位置
+
+    Args:
+        test_image: 输入图像
+        region_name: 区域名称
+        region_id: 区域ID
+        crop_width: 裁剪宽度
+        crop_height: 裁剪高度
+        relative_x: 相对偏移 X
+        relative_y: 相对偏移 Y
+        center_x: 树集群中心点 X
+        center_y: 树集群中心点 Y
+
+    Returns:
+        (可视化图像, 信息文本)
+    """
+    if test_image is None:
+        return None, "请先上传图像并检测中心点"
+
+    try:
+        # 转换图像格式
+        if isinstance(test_image, Image.Image):
+            image_np = np.array(test_image)
+        else:
+            image_np = test_image
+
+        # 转换为BGR格式
+        if len(image_np.shape) == 3 and image_np.shape[2] == 3:
+            image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+        else:
+            image_bgr = image_np
+
+        h, w = image_bgr.shape[:2]
+
+        # 创建可视化图像
+        vis_image = image_bgr.copy()
+
+        # 绘制中心点
+        if center_x > 0 and center_y > 0:
+            cv2.circle(vis_image, (int(center_x), int(center_y)), 15, (0, 0, 255), -1)
+            cv2.putText(vis_image, f"Center ({int(center_x)}, {int(center_y)})",
+                       (int(center_x) + 25, int(center_y)),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            # 绘制十字线
+            cv2.line(vis_image, (int(center_x), 0), (int(center_x), h), (0, 0, 255), 1)
+            cv2.line(vis_image, (0, int(center_y)), (w, int(center_y)), (0, 0, 255), 1)
+
+        # 计算当前区域的绝对坐标
+        abs_x = int(center_x + relative_x)
+        abs_y = int(center_y + relative_y)
+
+        # 确保在图像范围内
+        abs_x = max(0, min(abs_x, w - crop_width))
+        abs_y = max(0, min(abs_y, h - crop_height))
+
+        # 绘制半透明矩形（绿色=当前正在配置的区域）
+        overlay = vis_image.copy()
+        cv2.rectangle(overlay, (abs_x, abs_y), (abs_x + crop_width, abs_y + crop_height), (0, 255, 0), -1)
+        cv2.addWeighted(overlay, 0.3, vis_image, 0.7, 0, vis_image)
+
+        # 绘制边框
+        cv2.rectangle(vis_image, (abs_x, abs_y), (abs_x + crop_width, abs_y + crop_height), (0, 255, 0), 3)
+
+        # 绘制标签
+        label = f"{region_name or 'New Region'} ({abs_x}, {abs_y})"
+        cv2.putText(vis_image, label, (abs_x, abs_y - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        # 绘制尺寸标签
+        size_label = f"{crop_width}x{crop_height}"
+        cv2.putText(vis_image, size_label, (abs_x, abs_y + crop_height + 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        # 转换为RGB用于显示
+        vis_rgb = cv2.cvtColor(vis_image, cv2.COLOR_BGR2RGB)
+
+        # 构建信息文本
+        info_lines = [
+            f"=== 当前区域预览 ===",
+            f"区域名称: {region_name or '未命名'}",
+            f"区域ID: {region_id or '未设置'}",
+            f"树集群中心: ({int(center_x)}, {int(center_y)})",
+            f"相对偏移: ({relative_x}, {relative_y})",
+            f"绝对坐标: ({abs_x}, {abs_y})",
+            f"区域尺寸: {crop_width}x{crop_height}",
+            "",
+            "💡 提示:",
+            "  - 绿色半透明区域 = 当前配置的裁剪范围",
+            "  - 红色圆点 = 树集群中心点",
+            "  - 调整参数后点击'更新预览'查看效果"
+        ]
+
+        return vis_rgb, "\n".join(info_lines)
+
+    except Exception as e:
+        import traceback
+        return None, f"预览失败: {e}\n{traceback.format_exc()}"
+
+
+def preview_regions_on_image(test_image, regions_json: str, center_x: int, center_y: int) -> Tuple[Optional[np.ndarray], str]:
+    """
+    在图像上预览配置的检测区域
+
+    Args:
+        test_image: 输入图像
+        regions_json: 区域配置JSON
+        center_x: 树集群中心点 X
+        center_y: 树集群中心点 Y
+
+    Returns:
+        (可视化图像, 信息文本)
+    """
+    if test_image is None:
+        return None, "请先上传图像"
+
+    try:
+        # 转换图像格式
+        if isinstance(test_image, Image.Image):
+            image_np = np.array(test_image)
+        else:
+            image_np = test_image
+
+        # 转换为BGR格式
+        if len(image_np.shape) == 3 and image_np.shape[2] == 3:
+            image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+        else:
+            image_bgr = image_np
+
+        h, w = image_bgr.shape[:2]
+
+        # 解析区域配置
+        regions = []
+        if regions_json:
+            try:
+                regions = json.loads(regions_json)
+            except:
+                pass
+
+        # 创建可视化图像
+        vis_image = image_bgr.copy()
+
+        # 绘制中心点
+        if center_x > 0 and center_y > 0:
+            cv2.circle(vis_image, (int(center_x), int(center_y)), 20, (0, 0, 255), -1)
+            cv2.putText(vis_image, f"Center ({int(center_x)}, {int(center_y)})",
+                       (int(center_x) + 30, int(center_y)),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            # 绘制十字线
+            cv2.line(vis_image, (int(center_x), 0), (int(center_x), h), (0, 0, 255), 1)
+            cv2.line(vis_image, (0, int(center_y)), (w, int(center_y)), (0, 0, 255), 1)
+
+        # 绘制每个区域
+        info_lines = [f"区域数量: {len(regions)}", ""]
+
+        # 颜色列表（不同区域用不同颜色）
+        colors = [(0, 255, 0), (255, 0, 0), (0, 255, 255), (255, 255, 0), (255, 0, 255)]
+
+        for i, region in enumerate(regions):
+            region_name = region.get("region_name", f"区域{i+1}")
+            crop_params = region.get("crop_params", {})
+            region_width = crop_params.get("width", 550)
+            region_height = crop_params.get("height", 870)
+            relative_x = crop_params.get("relative_x", 0)
+            relative_y = crop_params.get("relative_y", 0)
+
+            # 计算绝对坐标
+            abs_x = int(center_x + relative_x)
+            abs_y = int(center_y + relative_y)
+
+            # 确保在图像范围内
+            abs_x = max(0, min(abs_x, w - region_width))
+            abs_y = max(0, min(abs_y, h - region_height))
+
+            # 选择颜色
+            color = colors[i % len(colors)]
+
+            # 绘制半透明矩形
+            overlay = vis_image.copy()
+            cv2.rectangle(overlay, (abs_x, abs_y), (abs_x + region_width, abs_y + region_height), color, -1)
+            cv2.addWeighted(overlay, 0.2, vis_image, 0.8, 0, vis_image)
+
+            # 绘制边框
+            cv2.rectangle(vis_image, (abs_x, abs_y), (abs_x + region_width, abs_y + region_height), color, 3)
+
+            # 绘制标签
+            label = f"{region_name} ({abs_x}, {abs_y})"
+            cv2.putText(vis_image, label, (abs_x, abs_y - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            # 添加信息
+            info_lines.append(f"区域 {i+1}: {region_name}")
+            info_lines.append(f"  相对偏移: ({relative_x}, {relative_y})")
+            info_lines.append(f"  绝对坐标: ({abs_x}, {abs_y})")
+            info_lines.append(f"  尺寸: {region_width}x{region_height}")
+            info_lines.append("")
+
+        # 转换为RGB用于显示
+        vis_rgb = cv2.cvtColor(vis_image, cv2.COLOR_BGR2RGB)
+
+        return vis_rgb, "\n".join(info_lines)
+
+    except Exception as e:
+        import traceback
+        return None, f"预览失败: {e}\n{traceback.format_exc()}"
+
+
+def clear_landmark_points(current_image) -> Tuple[str, np.ndarray, str]:
+    """
+    清除所有标识物标记点
+
+    Args:
+        current_image: 当前显示的图像
+
+    Returns:
+        (信息文本, 原始图像, 空的标记点JSON)
+    """
+    config_manager.landmark_points = []
+
+    # 恢复原始图像
+    if config_manager.reference_image is not None:
+        original_image = cv2.cvtColor(config_manager.reference_image, cv2.COLOR_BGR2RGB)
+    else:
+        original_image = current_image
+
+    return "✓ 已清除所有标记点", original_image, "[]"
+
+
+def add_detection_region(
+    region_name: str,
+    region_id: str,
+    crop_width: int,
+    crop_height: int,
+    relative_x: int,  # 改为相对偏移 X（相对于树集群中心）
+    relative_y: int,  # 改为相对偏移 Y（相对于树集群中心）
+    caption: str,
+    box_threshold: float,
+    text_threshold: float,
+    max_box_area: int,
+    min_box_area: int,
+    regions_json: str
+) -> Tuple[str, str]:
+    """
+    添加检测区域（使用相对偏移坐标）
+
+    Args:
+        region_name: 区域名称
+        region_id: 区域ID
+        crop_width: 裁剪宽度
+        crop_height: 裁剪高度
+        relative_x: 相对偏移 X（相对于树集群中心，负数=左边，正数=右边）
+        relative_y: 相对偏移 Y（相对于树集群中心，负数=上方，正数=下方）
+        caption: 检测提示词
+        box_threshold: 边界框阈值
+        text_threshold: 文本阈值
+        max_box_area: 最大框面积
+        min_box_area: 最小框面积
+        regions_json: 现有区域JSON
+
+    Returns:
+        (信息文本, 更新后的区域JSON)
+    """
+    if not region_name or not region_id:
+        return "请填写区域名称和ID", regions_json
+
+    try:
+        # 解析现有区域
+        if regions_json:
+            regions = json.loads(regions_json)
+        else:
+            regions = []
+
+        # 检查ID是否重复
+        if any(r.get("region_id") == region_id for r in regions):
+            return f"区域ID '{region_id}' 已存在，请使用不同的ID", regions_json
+
+        # 创建新区域（使用相对偏移）
+        new_region = {
+            "region_id": region_id,
+            "region_name": region_name,
+            "crop_params": {
+                "width": crop_width,
+                "height": crop_height,
+                "relative_x": relative_x,  # 相对于树集群中心的偏移
+                "relative_y": relative_y,
+                "absolute_x": 0,  # 运行时动态计算
+                "absolute_y": 0
+            },
+            "detection_params": {
+                "caption": caption,
+                "box_threshold": box_threshold,
+                "text_threshold": text_threshold,
+                "max_box_area": max_box_area,
+                "min_box_area": min_box_area
+            }
+        }
+
+        regions.append(new_region)
+        config_manager.detection_regions = regions
+
+        updated_json = json.dumps(regions, ensure_ascii=False, indent=2)
+        info = f"✓ 已添加区域: {region_name} (ID: {region_id})\n相对偏移: ({relative_x}, {relative_y})\n总区域数: {len(regions)}"
+
+        return info, updated_json
+
+    except Exception as e:
+        return f"添加区域失败: {e}", regions_json
+
+
+def preview_config(regions_json: str, camera_name: str, rtsp_url: str, sample_interval: int,
+                   center_x: int, center_y: int,
+                   dino_caption: str = "tree",
+                   dino_box_threshold: float = 0.3,
+                   dino_text_threshold: float = 0.25) -> str:
+    """
+    预览完整配置
+
+    Returns:
+        配置JSON字符串
+    """
+    # 解析区域
+    regions = []
+    if regions_json:
+        try:
+            regions = json.loads(regions_json)
+        except:
+            pass
+
+    # 生成简化的配置结构
+    config = {
+        "version": "2.0",
+        "camera_name": camera_name,
+        "created_at": datetime.now().isoformat(),
+        "dino_params": {
+            "caption": dino_caption,
+            "box_threshold": dino_box_threshold,
+            "text_threshold": dino_text_threshold,
+            "device": DEVICE
+        },
+        "reference_center": {
+            "x": center_x,
+            "y": center_y
+        },
+        "rtsp_settings": {
+            "url": rtsp_url,
+            "sample_interval": sample_interval
+        },
+        "detection_regions": regions
+    }
+
+    config_manager.detection_regions = regions
+    config_manager.current_config = config
+
+    return json.dumps(config, ensure_ascii=False, indent=2)
+
+
+def save_config_file(camera_name: str, config_json: str) -> str:
+    """
+    保存配置文件
+
+    Args:
+        camera_name: 相机名称
+        config_json: 配置JSON字符串
+
+    Returns:
+        保存结果信息
+    """
+    if not camera_name:
+        return "请输入相机名称"
+
+    try:
+        # 解析配置
+        config = json.loads(config_json)
+
+        # 生成文件名
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        safe_name = "".join(c if c.isalnum() or c in ('-', '_') else '_' for c in camera_name)
+        filename = f"{safe_name}_{timestamp}.json"
+        filepath = CONFIGS_DIR / filename
+
+        # 保存配置
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+
+        return f"✓ 配置已保存: {filepath}\n相机: {camera_name}\n区域数: {len(config.get('detection_regions', []))}"
+
+    except Exception as e:
+        return f"保存配置失败: {e}"
+
+
+
+def load_existing_config(config_file: str) -> Tuple[str, str, int, int, str, str, str, str, float, float]:
+    """
+    加载现有配置文件
+
+    Args:
+        config_file: 配置文件路径
+
+    Returns:
+        (相机名称, 区域JSON, 中心点X, 中心点Y, RTSP URL, 采样间隔,
+         DINO 文本提示, DINO 框阈值, DINO 文本阈值)
+    """
+    if not config_file:
+        default_vals = ("", "[]", 0, 0, "", 30, "tree", 0.3, 0.25)
+        return default_vals
+
+    try:
+        with open(config_file, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+
+        # 重置配置管理器
+        config_manager.reset()
+        config_manager.current_config = config.copy()
+
+        # 提取基本信息
+        camera_name = config.get("camera_name", "")
+
+        # 获取中心点
+        reference_center = config.get("reference_center", {"x": 0, "y": 0})
+        center_x = reference_center.get("x", 0)
+        center_y = reference_center.get("y", 0)
+
+        # RTSP 设置
+        rtsp_settings = config.get("rtsp_settings", {})
+        rtsp_url = rtsp_settings.get("url", "")
+        sample_interval = rtsp_settings.get("sample_interval", 30)
+
+        # DINO 参数
+        dino_params = config.get("dino_params", {})
+        dino_caption = dino_params.get("caption", "tree")
+        dino_box_threshold = dino_params.get("box_threshold", 0.3)
+        dino_text_threshold = dino_params.get("text_threshold", 0.25)
+
+        # 加载区域
+        detection_regions = config.get("detection_regions", [])
+        regions_json = json.dumps(detection_regions, ensure_ascii=False, indent=2)
+        config_manager.detection_regions = detection_regions
+
+        return (
+            camera_name, regions_json, center_x, center_y,
+            rtsp_url, sample_interval,
+            dino_caption, dino_box_threshold, dino_text_threshold
+        )
+
+    except Exception as e:
+        default_vals = ("", "[]", 0, 0, "", 30, "tree", 0.3, 0.25)
+        return default_vals
+
 
 # Use this command for evaluate the Grounding DINO model
-config_file = "groundingdino/config/GroundingDINO_SwinT_OGC.py"
+config_file = "groundingdino/config/GroundingDINO_SwinB_cfg.py"
 ckpt_repo_id = "ShilongLiu/GroundingDINO"
-ckpt_filenmae = "groundingdino_swint_ogc.pth"
+ckpt_filenmae = "groundingdino_swinb_cogcoor.pth"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -153,7 +1177,7 @@ def load_model_hf(model_config_path, repo_id, filename, device='cpu'):
     model = build_model(args)
 
     # cache_file = hf_hub_download(repo_id=repo_id, filename=filename)
-    cache_file = str(Path(__file__).resolve().parents[1] / "weights" / "groundingdino_swint_ogc.pth")
+    cache_file = str(Path(__file__).resolve().parents[1] / "weights" / "groundingdino_swinb_cogcoor.pth")
     checkpoint = torch.load(cache_file, map_location='cpu')
     log = model.load_state_dict(clean_state_dict(checkpoint['model']), strict=False)
     model = model.to(device)
@@ -1196,5 +2220,369 @@ if __name__ == "__main__":
                     outputs=[json_output, video_gallery, stage_info_output, json_download, zip_download]
                 )
 
+            # 配置标记标签页（简化版）
+            with gr.Tab("多区域检测配置"):
+                gr.Markdown("### 树集群中心点检测与多区域配置工具")
+                gr.Markdown("""
+                **功能说明：**
+                1. 上传图像自动检测树集群中心点
+                2. 配置多个检测区域，裁剪参数相对于树集群中心点
+                3. RTSP 运行时会定期重新检测中心点并动态调整裁剪区域
+
+                **使用步骤：**
+                1. 输入相机名称和 RTSP 地址
+                2. 上传图像并检测树集群中心点
+                3. 添加检测区域（裁剪参数相对于中心点）
+                4. 预览并保存配置
+                """)
+
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### 1. 基础配置")
+                        camera_name = gr.Textbox(
+                            label="相机名称",
+                            placeholder="例如: 衷和楼1702",
+                            value=""
+                        )
+                        rtsp_url_config = gr.Textbox(
+                            label="RTSP地址",
+                            placeholder="rtsp://...",
+                            value=""
+                        )
+                        sample_interval_config = gr.Slider(
+                            label="采样间隔（秒）",
+                            minimum=1,
+                            maximum=300,
+                            value=30,
+                            step=1,
+                            info="RTSP检测时间间隔"
+                        )
+
+                        gr.Markdown("#### 2. 树集群中心点检测")
+                        gr.Markdown("""
+                        **说明：** 上传一张包含树木的图像，系统将自动检测树集群的中心点。
+                        这个中心点将作为所有检测区域裁剪参数的参考原点。
+                        """)
+
+                        detect_image_upload = gr.Image(
+                            label="上传图像用于检测中心点",
+                            type="pil"
+                        )
+
+                        with gr.Accordion("DINO 检测参数", open=True):
+                            dino_tree_caption = gr.Textbox(
+                                label="检测文本提示",
+                                value="tree",
+                                placeholder="例如: tree, plant, bush"
+                            )
+                            dino_box_threshold = gr.Slider(
+                                label="框置信度阈值",
+                                minimum=0.1,
+                                maximum=0.9,
+                                value=0.3,
+                                step=0.05,
+                                info="降低此值可检测更多树木"
+                            )
+                            dino_text_threshold = gr.Slider(
+                                label="文本阈值",
+                                minimum=0.1,
+                                maximum=0.9,
+                                value=0.25,
+                                step=0.05
+                            )
+
+                        detect_center_btn = gr.Button("🎯 检测树集群中心点", variant="primary", size="sm")
+
+                        # 存储检测到的中心点（隐藏）
+                        detected_center_x = gr.Number(
+                            label="检测到的中心点 X",
+                            value=0,
+                            interactive=False,
+                            visible=False
+                        )
+                        detected_center_y = gr.Number(
+                            label="检测到的中心点 Y",
+                            value=0,
+                            interactive=False,
+                            visible=False
+                        )
+
+                        center_detection_image = gr.Image(
+                            label="检测结果可视化",
+                            interactive=False
+                        )
+                        center_detection_info = gr.Textbox(
+                            label="检测结果信息",
+                            lines=12,
+                            interactive=False
+                        )
+
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### 3. 检测区域配置")
+                        gr.Markdown("""
+                        **说明：** 裁剪参数是相对于树集群中心点的偏移量。
+                        - 相对偏移 X：负数=左边，正数=右边
+                        - 相对偏移 Y：负数=上方，正数=下方
+                        """)
+
+                        region_name = gr.Textbox(
+                            label="区域名称",
+                            placeholder="例如: 左侧区域",
+                            value=""
+                        )
+                        region_id = gr.Textbox(
+                            label="区域ID",
+                            placeholder="例如: region_a",
+                            value=""
+                        )
+
+                        with gr.Accordion("裁剪参数", open=True):
+                            crop_width_config = gr.Slider(
+                                label="裁剪宽度",
+                                minimum=100,
+                                maximum=1920,
+                                value=550,
+                                step=10
+                            )
+                            crop_height_config = gr.Slider(
+                                label="裁剪高度",
+                                minimum=100,
+                                maximum=1920,
+                                value=870,
+                                step=10
+                            )
+                            crop_x_config = gr.Slider(
+                                label="相对偏移 X",
+                                minimum=-2000,
+                                maximum=2000,
+                                value=-400,
+                                step=10,
+                                info="相对于中心点的偏移，负数=左边"
+                            )
+                            crop_y_config = gr.Slider(
+                                label="相对偏移 Y",
+                                minimum=-1000,
+                                maximum=1000,
+                                value=200,
+                                step=10,
+                                info="相对于中心点的偏移，负数=上方"
+                            )
+
+                        with gr.Accordion("检测参数", open=True):
+                            caption_config = gr.Textbox(
+                                label="检测提示词",
+                                value="bike",
+                                placeholder="例如: bike, person, car"
+                            )
+                            box_threshold_config = gr.Slider(
+                                label="Box Threshold",
+                                minimum=0.0,
+                                maximum=1.0,
+                                value=0.12,
+                                step=0.01
+                            )
+                            text_threshold_config = gr.Slider(
+                                label="Text Threshold",
+                                minimum=0.0,
+                                maximum=1.0,
+                                value=1.0,
+                                step=0.01
+                            )
+                            max_box_area_config = gr.Slider(
+                                label="最大框面积（像素²）",
+                                minimum=0,
+                                maximum=500000,
+                                value=6000,
+                                step=5000
+                            )
+                            min_box_area_config = gr.Slider(
+                                label="最小框面积（像素²）",
+                                minimum=0,
+                                maximum=10000,
+                                value=150,
+                                step=100
+                            )
+
+                        add_region_btn = gr.Button("➕ 添加检测区域", variant="primary", size="sm")
+                        region_info = gr.Textbox(
+                            label="区域信息",
+                            lines=3,
+                            interactive=False
+                        )
+
+                        regions_json = gr.Textbox(
+                            label="区域数据 (内部使用)",
+                            visible=False,
+                            value="[]"
+                        )
+
+                        gr.Markdown("#### 实时预览（调整参数查看位置）")
+                        gr.Markdown("""
+                        **说明：** 上方显示当前配置的区域在图像上的预览位置。
+                        调整裁剪参数后，点击"更新预览"查看效果，确认位置正确后再添加到区域列表。
+                        """)
+
+                        current_region_preview_image = gr.Image(
+                            label="当前区域预览（绿色框=即将添加的区域）",
+                            interactive=False
+                        )
+                        current_region_preview_info = gr.Textbox(
+                            label="预览信息",
+                            lines=6,
+                            interactive=False
+                        )
+
+                        update_preview_btn = gr.Button("🔄 更新预览", variant="secondary", size="sm")
+
+                        gr.Markdown("---")
+
+                        # 已添加区域列表预览
+                        preview_regions_btn = gr.Button("👁️ 预览所有已添加区域", variant="secondary", size="sm")
+
+                        regions_preview_image = gr.Image(
+                            label="所有区域预览",
+                            interactive=False
+                        )
+                        regions_preview_info = gr.Textbox(
+                            label="所有区域信息",
+                            lines=5,
+                            interactive=False
+                        )
+
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("#### 4. 配置保存与加载")
+                        config_preview = gr.Textbox(
+                            label="配置预览 (JSON)",
+                            lines=12,
+                            interactive=False
+                        )
+                        with gr.Row():
+                            preview_btn = gr.Button("预览配置", variant="secondary", size="sm")
+                            save_config_btn = gr.Button("💾 保存配置文件", variant="primary")
+                            refresh_config_list_btn = gr.Button("🔄 刷新配置列表", size="sm")
+
+                        config_info = gr.Textbox(
+                            label="保存信息",
+                            lines=2,
+                            interactive=False
+                        )
+
+                    with gr.Column():
+                        gr.Markdown("#### 加载现有配置")
+                        load_config_dropdown = gr.Dropdown(
+                            label="选择配置文件",
+                            choices=[],
+                            interactive=True
+                        )
+                        load_config_btn = gr.Button("📂 加载配置", variant="secondary")
+
+                        loaded_config_info = gr.Textbox(
+                            label="加载信息",
+                            lines=5,
+                            interactive=False
+                        )
+
+                # 事件绑定
+                detect_center_btn.click(
+                    fn=detect_tree_cluster_center,
+                    inputs=[
+                        detect_image_upload,
+                        dino_tree_caption,
+                        dino_box_threshold,
+                        dino_text_threshold
+                    ],
+                    outputs=[center_detection_image, center_detection_info, detected_center_x, detected_center_y]
+                ).then(
+                    # 检测中心点后自动更新当前区域预览
+                    fn=preview_current_region_on_image,
+                    inputs=[
+                        detect_image_upload,
+                        region_name, region_id,
+                        crop_width_config, crop_height_config, crop_x_config, crop_y_config,
+                        detected_center_x, detected_center_y
+                    ],
+                    outputs=[current_region_preview_image, current_region_preview_info]
+                )
+
+                # 更新当前区域预览
+                update_preview_btn.click(
+                    fn=preview_current_region_on_image,
+                    inputs=[
+                        detect_image_upload,
+                        region_name, region_id,
+                        crop_width_config, crop_height_config, crop_x_config, crop_y_config,
+                        detected_center_x, detected_center_y
+                    ],
+                    outputs=[current_region_preview_image, current_region_preview_info]
+                )
+
+                add_region_btn.click(
+                    fn=add_detection_region,
+                    inputs=[
+                        region_name, region_id,
+                        crop_width_config, crop_height_config, crop_x_config, crop_y_config,
+                        caption_config, box_threshold_config, text_threshold_config,
+                        max_box_area_config, min_box_area_config,
+                        regions_json
+                    ],
+                    outputs=[region_info, regions_json]
+                ).then(
+                    # 添加区域后更新所有区域预览
+                    fn=preview_regions_on_image,
+                    inputs=[
+                        detect_image_upload,
+                        regions_json,
+                        detected_center_x,
+                        detected_center_y
+                    ],
+                    outputs=[regions_preview_image, regions_preview_info]
+                )
+
+                preview_regions_btn.click(
+                    fn=preview_regions_on_image,
+                    inputs=[
+                        detect_image_upload,
+                        regions_json,
+                        detected_center_x,
+                        detected_center_y
+                    ],
+                    outputs=[regions_preview_image, regions_preview_info]
+                )
+
+                preview_btn.click(
+                    fn=preview_config,
+                    inputs=[
+                        regions_json, camera_name, rtsp_url_config, sample_interval_config,
+                        detected_center_x, detected_center_y,
+                        dino_tree_caption, dino_box_threshold, dino_text_threshold
+                    ],
+                    outputs=[config_preview]
+                )
+
+                save_config_btn.click(
+                    fn=save_config_file,
+                    inputs=[camera_name, config_preview],
+                    outputs=[config_info]
+                )
+
+                refresh_config_list_btn.click(
+                    fn=lambda: gr.update(choices=list_config_files()),
+                    outputs=[load_config_dropdown]
+                )
+
+                load_config_btn.click(
+                    fn=load_existing_config,
+                    inputs=[load_config_dropdown],
+                    outputs=[
+                        camera_name, regions_json, detected_center_x, detected_center_y,
+                        rtsp_url_config, sample_interval_config,
+                        dino_tree_caption, dino_box_threshold, dino_text_threshold
+                    ]
+                ).then(
+                    fn=lambda cx, cy: f"✓ 配置已加载\n中心点: ({int(cx)}, {int(cy)})",
+                    inputs=[detected_center_x, detected_center_y],
+                    outputs=[loaded_config_info]
+                )
 
     block.launch(server_name='0.0.0.0', server_port=19555, debug=args.debug, share=False)

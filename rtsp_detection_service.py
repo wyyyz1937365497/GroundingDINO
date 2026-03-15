@@ -18,9 +18,28 @@ import signal
 import sys
 import subprocess
 import os
-from typing import Optional
+from typing import Optional, Dict, List, Tuple
 
 from is3_metadata_api import MetadataAPI
+
+# 导入图像配准模块
+try:
+    from image_registration import ImageRegistration, OffsetSmoother, DinoTreeGridRegistration
+    IMAGE_REGISTRATION_AVAILABLE = True
+except ImportError:
+    IMAGE_REGISTRATION_AVAILABLE = False
+    DinoTreeGridRegistration = None
+    logging.warning("图像配准模块不可用，多区域偏移补偿功能将被禁用")
+
+# 检查scipy是否可用（用于网格配准）
+try:
+    from scipy.spatial.distance import cdist
+    from scipy.optimize import linear_sum_assignment
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    linear_sum_assignment = None
+    logging.info("scipy未安装，网格配准功能不可用")
 
 # 配置日志
 logging.basicConfig(
@@ -283,8 +302,8 @@ def load_groundingdino_model():
     from groundingdino.util.utils import clean_state_dict
 
     project_root = Path(__file__).resolve().parents[0]
-    config_file = "groundingdino/config/GroundingDINO_SwinT_OGC.py"
-    checkpoint_path = project_root / "weights" / "groundingdino_swint_ogc.pth"
+    config_file = "groundingdino/config/groundingdino_swinb_cogcoor.py"
+    checkpoint_path = project_root / "weights" / "groundingdino_swinb_cogcoor.pth"
 
     logger.info(f"加载 GroundingDINO 模型...")
     logger.info(f"  配置文件: {config_file}")
@@ -326,6 +345,139 @@ def crop_image(image_np, crop_width, crop_height, crop_x, crop_y):
 
     cropped = image_np[crop_y:crop_y+crop_height, crop_x:crop_x+crop_width]
     return cropped
+
+
+# ========== 配置文件加载 ==========
+def load_camera_config(config_path: str) -> dict:
+    """
+    加载相机检测配置文件
+
+    Args:
+        config_path: 配置文件路径
+
+    Returns:
+        配置字典
+    """
+    config_file = Path(config_path)
+    if not config_file.exists():
+        logger.error(f"配置文件不存在: {config_path}")
+        return {}
+
+    try:
+        with open(config_file, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+
+        logger.info(f"配置文件已加载: {config_path}")
+        logger.info(f"  相机名称: {config.get('camera_name', 'N/A')}")
+        logger.info(f"  检测区域数: {len(config.get('detection_regions', []))}")
+        logger.info(f"  标识物点数: {len(config.get('registration', {}).get('landmark_points', []))}")
+
+        return config
+
+    except Exception as e:
+        logger.error(f"加载配置文件失败: {e}")
+        return {}
+
+
+# ========== 多区域裁剪 ==========
+def crop_multi_regions(image_np: np.ndarray, regions_config: List[Dict],
+                        dx: int = 0, dy: int = 0) -> List[Dict]:
+    """
+    对图像进行多区域裁剪
+
+    Args:
+        image_np: 输入图像
+        regions_config: 区域配置列表
+        dx: X方向偏移量
+        dy: Y方向偏移量
+
+    Returns:
+        裁剪结果列表 [{"region_id": "...", "crop": np.ndarray, "crop_params": dict}, ...]
+    """
+    results = []
+    h, w = image_np.shape[:2]
+
+    for region_config in regions_config:
+        region_id = region_config.get("region_id", "unknown")
+        region_name = region_config.get("region_name", "")
+
+        # 获取裁剪参数
+        crop_params = region_config.get("crop_params", {})
+        crop_width = crop_params.get("width", CONFIG["crop_width"])
+        crop_height = crop_params.get("height", CONFIG["crop_height"])
+        crop_x = crop_params.get("x", CONFIG["crop_x"])
+        crop_y = crop_params.get("y", CONFIG["crop_y"])
+
+        # 应用偏移量
+        if region_config.get("offset_correction", {}).get("enabled", True):
+            crop_x = int(crop_x + dx)
+            crop_y = int(crop_y + dy)
+
+        # 确保裁剪区域在图像范围内
+        crop_x = max(0, min(crop_x, w - crop_width))
+        crop_y = max(0, min(crop_y, h - crop_height))
+
+        # 裁剪图像
+        cropped = image_np[crop_y:crop_y+crop_height, crop_x:crop_x+crop_width]
+
+        results.append({
+            "region_id": region_id,
+            "region_name": region_name,
+            "crop": cropped,
+            "crop_params": {
+                "width": crop_width,
+                "height": crop_height,
+                "x": crop_x,
+                "y": crop_y
+            }
+        })
+
+    return results
+
+
+# ========== 多区域检测 ==========
+def detect_multi_regions(model, image_crops: List[Dict], regions_config: List[Dict],
+                         device: str) -> Dict[str, List]:
+    """
+    对多个裁剪区域进行检测
+
+    Args:
+        model: GroundingDINO模型
+        image_crops: 裁剪结果列表
+        regions_config: 区域配置列表
+        device: 设备
+
+    Returns:
+        检测结果字典 {"region_id": [detections, ...], ...}
+    """
+    results = {}
+
+    # 创建区域配置映射
+    region_config_map = {r.get("region_id"): r for r in regions_config}
+
+    for crop_data in image_crops:
+        region_id = crop_data["region_id"]
+        cropped_image = crop_data["crop"]
+
+        # 获取区域检测参数
+        region_config = region_config_map.get(region_id, {})
+        detection_params = region_config.get("detection_params", {})
+
+        caption = detection_params.get("caption", CONFIG["detection_caption"])
+        box_threshold = detection_params.get("box_threshold", CONFIG["box_threshold"])
+        text_threshold = detection_params.get("text_threshold", CONFIG["text_threshold"])
+        max_box_area = detection_params.get("max_box_area", CONFIG["max_box_area"])
+        min_box_area = detection_params.get("min_box_area", CONFIG["min_box_area"])
+
+        # 执行检测
+        detections = detect_objects(
+            model, cropped_image, caption, box_threshold, text_threshold,
+            max_box_area, min_box_area
+        )
+
+        results[region_id] = detections
+
+    return results
 
 
 # ========== 检测函数 ==========
@@ -482,6 +634,148 @@ def save_detection_result(frame_np, cropped_np, detections, output_dir, timestam
     return str(json_path)
 
 
+# ========== 多区域结果保存 ==========
+def save_multi_region_result(frame_np: np.ndarray, image_crops: List[Dict],
+                              detection_results: Dict[str, List], output_dir: Path,
+                              timestamp: datetime, camera_name: str = "camera",
+                              offset_info: Dict = None) -> List[str]:
+    """
+    保存多区域检测结果
+
+    Args:
+        frame_np: 原始帧
+        image_crops: 裁剪结果列表
+        detection_results: 检测结果字典
+        output_dir: 输出目录
+        timestamp: 时间戳
+        camera_name: 相机名称
+        offset_info: 偏移信息
+
+    Returns:
+        保存的JSON文件路径列表
+    """
+    from groundingdino.util.inference import annotate
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = f"frame_{timestamp.strftime('%Y%m%d_%H%M%S')}"
+
+    # 保存原始帧
+    original_path = output_dir / "original" / f"{filename}.jpg"
+    original_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(original_path), frame_np)
+
+    json_paths = []
+    total_detections = 0
+
+    for crop_data in image_crops:
+        region_id = crop_data["region_id"]
+        region_name = crop_data["region_name"]
+        cropped_image = crop_data["crop"]
+        crop_params = crop_data["crop_params"]
+
+        # 创建区域子目录
+        region_dir = output_dir / "regions" / region_id
+        region_dir.mkdir(parents=True, exist_ok=True)
+
+        # 保存裁剪图像
+        crop_path = region_dir / f"{filename}_crop.jpg"
+        cv2.imwrite(str(crop_path), cropped_image)
+
+        # 获取检测结果
+        detections = detection_results.get(region_id, [])
+        total_detections += len(detections)
+
+        # 创建带标注的图像
+        annotated = cropped_image.copy()
+        if detections:
+            boxes_list = []
+            logits_list = []
+            phrases_list = []
+
+            h_img, w_img = cropped_image.shape[:2]
+            for det in detections:
+                cx = det["center_x"]
+                cy = det["center_y"]
+                bw = det["width"] / w_img
+                bh = det["height"] / h_img
+
+                boxes_list.append([cx, cy, bw, bh])
+                logits_list.append(det["confidence"])
+                phrases_list.append(det["label"])
+
+            if boxes_list:
+                boxes_tensor = torch.tensor(boxes_list)
+                logits_tensor = torch.tensor(logits_list)
+
+                annotated = annotate(
+                    image_source=cropped_image,
+                    boxes=boxes_tensor,
+                    logits=logits_tensor,
+                    phrases=phrases_list
+                )
+                annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+            else:
+                annotated_rgb = cropped_image
+        else:
+            annotated_rgb = cropped_image
+
+        # 保存带标注的图像
+        annotated_path = region_dir / f"{filename}_annotated.jpg"
+        cv2.imwrite(str(annotated_path), annotated_rgb)
+
+        # 保存区域检测结果JSON
+        region_result = {
+            "timestamp": timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+            "timestamp_unix": timestamp.timestamp(),
+            "camera_name": camera_name,
+            "region_id": region_id,
+            "region_name": region_name,
+            "original_image": str(original_path),
+            "cropped_image": str(crop_path),
+            "annotated_image": str(annotated_path),
+            "crop_params": crop_params,
+            "offset_correction": offset_info,
+            "detection_count": len(detections),
+            "detections": detections
+        }
+
+        region_json_path = region_dir / f"{filename}.json"
+        with open(region_json_path, 'w', encoding='utf-8') as f:
+            json.dump(region_result, f, ensure_ascii=False, indent=2)
+
+        json_paths.append(str(region_json_path))
+
+    # 保存汇总结果
+    summary_result = {
+        "timestamp": timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+        "timestamp_unix": timestamp.timestamp(),
+        "camera_name": camera_name,
+        "original_image": str(original_path),
+        "total_detection_count": total_detections,
+        "regions": [
+            {
+                "region_id": crop_data["region_id"],
+                "region_name": crop_data["region_name"],
+                "detection_count": len(detection_results.get(crop_data["region_id"], [])),
+                "crop_params": crop_data["crop_params"]
+            }
+            for crop_data in image_crops
+        ],
+        "offset_correction": offset_info
+    }
+
+    summary_json_path = output_dir / "json" / f"{filename}_summary.json"
+    summary_json_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(summary_json_path, 'w', encoding='utf-8') as f:
+        json.dump(summary_result, f, ensure_ascii=False, indent=2)
+
+    json_paths.append(str(summary_json_path))
+
+    return json_paths
+
+
 # ========== 更新汇总 JSON ==========
 def update_summary_json(output_dir, latest_result):
     """更新汇总 JSON 文件"""
@@ -538,12 +832,91 @@ def main():
 
     logger.info("=" * 60)
 
+    # 加载相机配置（如果指定）
+    camera_config_path = os.getenv("CAMERA_CONFIG_PATH", "")
+    camera_config = {}
+    multi_region_mode = False
+
+    if camera_config_path and os.path.exists(camera_config_path):
+        camera_config = load_camera_config(camera_config_path)
+        multi_region_mode = bool(camera_config.get("detection_regions"))
+
+        if multi_region_mode:
+            logger.info("✓ 多区域检测模式已启用")
+
+            # 更新相机配置
+            if camera_config.get("camera_name"):
+                CONFIG["is3"]["camera_code"] = camera_config["camera_name"]
+            if camera_config.get("rtsp_settings", {}).get("url"):
+                CONFIG["rtsp_url"] = camera_config["rtsp_settings"]["url"]
+            if camera_config.get("rtsp_settings", {}).get("sample_interval"):
+                CONFIG["sample_interval"] = camera_config["rtsp_settings"]["sample_interval"]
+            if camera_config.get("rtsp_settings", {}).get("output_dir"):
+                CONFIG["output_dir"] = camera_config["rtsp_settings"]["output_dir"]
+        else:
+            logger.warning("配置文件未定义检测区域，使用单区域模式")
+    else:
+        logger.info("未指定配置文件或文件不存在，使用单区域模式")
+
+    # 初始化图像配准器
+    image_registration = None
+    current_offset = {"dx": 0, "dy": 0}
+
+    if multi_region_mode and IMAGE_REGISTRATION_AVAILABLE:
+        registration_config = camera_config.get("registration", {})
+        if registration_config.get("enabled", True):
+            reg_method = registration_config.get("method", "DINO_TREE_GRID")
+            ref_image_path = registration_config.get("reference_image_path", "")
+
+            if reg_method == "DINO_TREE_GRID":
+                # DINO 树木网格配准
+                if not SCIPY_AVAILABLE or DinoTreeGridRegistration is None:
+                    logger.warning("scipy未安装或DinoTreeGridRegistration不可用，无法使用 DINO 树木网格配准")
+                elif ref_image_path and os.path.exists(ref_image_path):
+                    reg_params = {
+                        "caption": registration_config.get("caption", "tree"),
+                        "box_threshold": registration_config.get("box_threshold", 0.3),
+                        "text_threshold": registration_config.get("text_threshold", 0.25),
+                        "device": CONFIG.get("device", "cuda" if torch.cuda.is_available() else "cpu"),
+                        "smoothing_window": registration_config.get("smoothing_window", 5)
+                    }
+
+                    # 需要模型，稍后在加载模型后初始化
+                    dino_reg_params = reg_params
+                    logger.info(f"将使用 DINO 树木网格配准")
+                else:
+                    logger.warning("未找到参考图像，偏移补偿将被禁用")
+            else:
+                logger.warning(f"不支持的配准方法: {reg_method}，仅支持 DINO_TREE_GRID")
+
     # 加载模型
     try:
         model = load_groundingdino_model()
     except Exception as e:
         logger.error(f"模型加载失败: {e}")
         return
+
+    # 初始化 DINO 树木网格配准器（需要模型）
+    image_registration = None
+    if multi_region_mode and IMAGE_REGISTRATION_AVAILABLE and 'dino_reg_params' in locals():
+        registration_config = camera_config.get("registration", {})
+        ref_image_path = registration_config.get("reference_image_path", "")
+
+        if ref_image_path and os.path.exists(ref_image_path):
+            try:
+                image_registration = DinoTreeGridRegistration(model=model, config=dino_reg_params)
+                ref_image = cv2.imread(ref_image_path)
+                if image_registration.set_reference_image(ref_image):
+                    logger.info(f"✓ DINO 树木网格配准器已初始化")
+                    logger.info(f"  检测文本: {dino_reg_params['caption']}")
+                    logger.info(f"  框阈值: {dino_reg_params['box_threshold']}")
+                    logger.info(f"  文本阈值: {dino_reg_params['text_threshold']}")
+                else:
+                    logger.warning("设置参考图像失败，偏移补偿将被禁用")
+                    image_registration = None
+            except Exception as e:
+                logger.error(f"DINO 树木网格配准器初始化失败: {e}")
+                image_registration = None
 
     # 创建输出目录
     output_dir = Path(CONFIG["output_dir"])
@@ -636,6 +1009,9 @@ def main():
     logger.info(f"✓ RTSP 连接成功!")
     logger.info(f"  分辨率: {w}x{h}")
     logger.info(f"  采样间隔: {CONFIG['sample_interval']} 秒")
+    logger.info(f"  检测模式: {'多区域' if multi_region_mode else '单区域'}")
+    if image_registration:
+        logger.info(f"  偏移补偿: 启用 ({image_registration.method})")
     logger.info("=" * 60)
 
     last_sample_time = 0
@@ -694,70 +1070,157 @@ def main():
             logger.debug(f"帧质量正常 (均值={gray_mean:.1f}, 标准差={gray_std:.1f})")
 
             try:
-                # 裁剪图像
-                if CONFIG["enable_crop"]:
-                    cropped = crop_image(
-                        frame,
-                        CONFIG["crop_width"],
-                        CONFIG["crop_height"],
-                        CONFIG["crop_x"],
-                        CONFIG["crop_y"]
-                    )
-                    detect_image = cropped
-                else:
-                    detect_image = frame
+                # 计算偏移量（如果启用）
+                dx, dy = 0, 0
+                offset_confidence = 0.0
 
-                # 检测物体
-                detections = detect_objects(
-                    model,
-                    detect_image,
-                    CONFIG["detection_caption"],
-                    CONFIG["box_threshold"],
-                    CONFIG["text_threshold"],
-                    CONFIG["max_box_area"],
-                    CONFIG["min_box_area"]
-                )
+                if image_registration:
+                    dx, dy, offset_confidence, offset_debug = image_registration.compute_offset(frame)
+                    current_offset = {"dx": dx, "dy": dy, "confidence": offset_confidence}
 
-                detection_count += 1
-                total_detected_items += len(detections)
-
-                # 保存结果
-                if CONFIG["enable_crop"]:
-                    save_frame = cropped
-                else:
-                    save_frame = frame
-
-                json_path = save_detection_result(
-                    frame,
-                    save_frame,
-                    detections,
-                    CONFIG["output_dir"],
-                    timestamp
-                )
-
-                # 更新汇总
-                with open(json_path, 'r', encoding='utf-8') as f:
-                    latest_result = json.load(f)
-                update_summary_json(CONFIG["output_dir"], latest_result)
-
-                # 上传到 iS3 平台
-                if is3_client.is_available():
-                    is3_ok = is3_client.upload_detection_result(latest_result)
-                    if is3_ok:
-                        logger.info("  iS3 上传成功（文件 + 元数据）")
+                    if offset_debug.get("success"):
+                        logger.debug(f"  偏移量: dx={dx}, dy={dy}, confidence={offset_confidence:.2f}")
                     else:
-                        logger.warning("  iS3 上传部分或全部失败")
+                        logger.debug(f"  偏移量计算失败，使用历史值: dx={dx}, dy={dy}")
 
-                # 输出结果
-                if detections:
-                    logger.info(f"  检测到 {len(detections)} 个 {CONFIG['detection_caption']}")
-                    for i, det in enumerate(detections):
-                        logger.info(f"    [{i+1}] {det['label']} - 置信度: {det['confidence']:.3f}, "
-                                  f"面积: {det['area']:.0f} px²")
+                if multi_region_mode:
+                    # 多区域检测模式
+                    detection_regions = camera_config.get("detection_regions", [])
+
+                    # 应用偏移量并进行多区域裁剪
+                    image_crops = crop_multi_regions(frame, detection_regions, dx, dy)
+
+                    # 多区域检测
+                    detection_results = detect_multi_regions(model, image_crops, detection_regions, CONFIG["device"])
+
+                    # 统计总检测数
+                    total_frame_detections = sum(len(detections) for detections in detection_results.values())
+
+                    detection_count += 1
+                    total_detected_items += total_frame_detections
+
+                    # 保存多区域结果
+                    json_paths = save_multi_region_result(
+                        frame, image_crops, detection_results,
+                        CONFIG["output_dir"], timestamp,
+                        camera_config.get("camera_name", CONFIG["is3"]["camera_code"]),
+                        current_offset if image_registration else None
+                    )
+
+                    # 输出结果
+                    for crop_data in image_crops:
+                        region_id = crop_data["region_id"]
+                        region_name = crop_data["region_name"]
+                        detections = detection_results.get(region_id, [])
+
+                        if detections:
+                            logger.info(f"  区域 [{region_name}] 检测到 {len(detections)} 个目标")
+                            for i, det in enumerate(detections[:3]):  # 只显示前3个
+                                logger.info(f"    [{i+1}] {det['label']} - 置信度: {det['confidence']:.3f}")
+                        else:
+                            logger.info(f"  区域 [{region_name}] 未检测到目标")
+
+                    logger.info(f"  总检测数: {total_frame_detections}")
+
+                    # 更新汇总（使用第一个区域的JSON作为最新结果）
+                    if json_paths:
+                        with open(json_paths[-1], 'r', encoding='utf-8') as f:
+                            latest_result = json.load(f)
+                        update_summary_json(CONFIG["output_dir"], latest_result)
+
+                    # 上传到 iS3 平台（使用汇总结果）
+                    if is3_client.is_available():
+                        if total_frame_detections < 5:
+                            logger.info(f"  iS3 上传跳过：检测到 {total_frame_detections} 个目标（阈值：5）")
+                        else:
+                            # 构造兼容的上传结果
+                            upload_result = {
+                                "timestamp": latest_result.get("timestamp"),
+                                "detections": [],
+                                "detection_count": total_frame_detections,
+                                "annotated_image": latest_result.get("original_image")
+                            }
+                            for region_id, detections in detection_results.items():
+                                upload_result["detections"].extend(detections)
+
+                            is3_ok = is3_client.upload_detection_result(upload_result)
+                            if is3_ok:
+                                logger.info("  iS3 上传成功（文件 + 元数据）")
+                            else:
+                                logger.warning("  iS3 上传部分或全部失败")
+
+                    logger.info(f"  结果已保存: {len(json_paths)} 个文件")
+
                 else:
-                    logger.info(f"  未检测到 {CONFIG['detection_caption']}")
+                    # 单区域检测模式（原有逻辑）
+                    if CONFIG["enable_crop"]:
+                        cropped = crop_image(
+                            frame,
+                            CONFIG["crop_width"],
+                            CONFIG["crop_height"],
+                            CONFIG["crop_x"],
+                            CONFIG["crop_y"]
+                        )
+                        detect_image = cropped
+                    else:
+                        detect_image = frame
 
-                logger.info(f"  结果已保存: {json_path}")
+                    # 检测物体
+                    detections = detect_objects(
+                        model,
+                        detect_image,
+                        CONFIG["detection_caption"],
+                        CONFIG["box_threshold"],
+                        CONFIG["text_threshold"],
+                        CONFIG["max_box_area"],
+                        CONFIG["min_box_area"]
+                    )
+
+                    detection_count += 1
+                    total_detected_items += len(detections)
+
+                    # 保存结果
+                    if CONFIG["enable_crop"]:
+                        save_frame = cropped
+                    else:
+                        save_frame = frame
+
+                    json_path = save_detection_result(
+                        frame,
+                        save_frame,
+                        detections,
+                        CONFIG["output_dir"],
+                        timestamp
+                    )
+
+                    # 更新汇总
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        latest_result = json.load(f)
+                    update_summary_json(CONFIG["output_dir"], latest_result)
+
+                    # 上传到 iS3 平台
+                    if is3_client.is_available():
+                        # 检测数量小于5时跳过上传
+                        if len(detections) < 5:
+                            logger.info(f"  iS3 上传跳过：检测到 {len(detections)} 个目标（阈值：5）")
+                        else:
+                            is3_ok = is3_client.upload_detection_result(latest_result)
+                            if is3_ok:
+                                logger.info("  iS3 上传成功（文件 + 元数据）")
+                            else:
+                                logger.warning("  iS3 上传部分或全部失败")
+
+                    # 输出结果
+                    if detections:
+                        logger.info(f"  检测到 {len(detections)} 个 {CONFIG['detection_caption']}")
+                        for i, det in enumerate(detections):
+                            logger.info(f"    [{i+1}] {det['label']} - 置信度: {det['confidence']:.3f}, "
+                                      f"面积: {det['area']:.0f} px²")
+                    else:
+                        logger.info(f"  未检测到 {CONFIG['detection_caption']}")
+
+                    logger.info(f"  结果已保存: {json_path}")
+
                 logger.info(f"  资源: {resource_monitor.get_summary()}")
 
             except Exception as e:

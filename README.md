@@ -187,7 +187,7 @@ pip install -e .
 ```bash
 mkdir weights
 cd weights
-wget -q https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth
+wget -q https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swinb_cogcoor.pth
 cd ..
 ```
 
@@ -200,8 +200,8 @@ nvidia-smi
 Replace `{GPU ID}`, `image_you_want_to_detect.jpg`, and `"dir you want to save the output"` with appropriate values in the following command
 ```bash
 CUDA_VISIBLE_DEVICES={GPU ID} python demo/inference_on_a_image.py \
--c groundingdino/config/GroundingDINO_SwinT_OGC.py \
--p weights/groundingdino_swint_ogc.pth \
+-c groundingdino/config/groundingdino_swinb_cogcoor.py \
+-p weights/groundingdino_swinb_cogcoor.pth \
 -i image_you_want_to_detect.jpg \
 -o "dir you want to save the output" \
 -t "chair"
@@ -211,8 +211,8 @@ CUDA_VISIBLE_DEVICES={GPU ID} python demo/inference_on_a_image.py \
 If you would like to specify the phrases to detect, here is a demo:
 ```bash
 CUDA_VISIBLE_DEVICES={GPU ID} python demo/inference_on_a_image.py \
--c groundingdino/config/GroundingDINO_SwinT_OGC.py \
--p ./groundingdino_swint_ogc.pth \
+-c groundingdino/config/groundingdino_swinb_cogcoor.py \
+-p ./groundingdino_swinb_cogcoor.pth \
 -i .asset/cat_dog.jpeg \
 -o logs/1111 \
 -t "There is a cat and a dog in the image ." \
@@ -229,7 +229,7 @@ See the `demo/inference_on_a_image.py` for more details.
 from groundingdino.util.inference import load_model, load_image, predict, annotate
 import cv2
 
-model = load_model("groundingdino/config/GroundingDINO_SwinT_OGC.py", "weights/groundingdino_swint_ogc.pth")
+model = load_model("groundingdino/config/groundingdino_swinb_cogcoor.py", "weights/groundingdino_swinb_cogcoor.pth")
 IMAGE_PATH = "weights/dog-3.jpeg"
 TEXT_PROMPT = "chair . person . dog ."
 BOX_TRESHOLD = 0.35
@@ -264,8 +264,8 @@ We provide an example to evaluate Grounding DINO zero-shot performance on COCO. 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 python demo/test_ap_on_coco.py \
- -c groundingdino/config/GroundingDINO_SwinT_OGC.py \
- -p weights/groundingdino_swint_ogc.pth \
+ -c groundingdino/config/groundingdino_swinb_cogcoor.py \
+ -p weights/groundingdino_swinb_cogcoor.pth \
  --anno_path /path/to/annoataions/ie/instances_val2017.json \
  --image_dir /path/to/imagedir/ie/val2017
 ```
@@ -293,8 +293,8 @@ python demo/test_ap_on_coco.py \
       <td>Swin-T</td>
       <td>O365,GoldG,Cap4M</td>
       <td>48.4 (zero-shot) / 57.2 (fine-tune)</td>
-      <td><a href="https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth">GitHub link</a> | <a href="https://huggingface.co/ShilongLiu/GroundingDINO/resolve/main/groundingdino_swint_ogc.pth">HF link</a></td>
-      <td><a href="https://github.com/IDEA-Research/GroundingDINO/blob/main/groundingdino/config/GroundingDINO_SwinT_OGC.py">link</a></td>
+      <td><a href="https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swinb_cogcoor.pth">GitHub link</a> | <a href="https://huggingface.co/ShilongLiu/GroundingDINO/resolve/main/groundingdino_swinb_cogcoor.pth">HF link</a></td>
+      <td><a href="https://github.com/IDEA-Research/GroundingDINO/blob/main/groundingdino/config/groundingdino_swinb_cogcoor.py">link</a></td>
     </tr>
     <tr>
       <th>2</th>
